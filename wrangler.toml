@@ -1,6 +1,6 @@
 name = "compressly"
 compatibility_date = "2026-03-08"
-
+pages_build_output_dir = "./dist"
 [[kv_namespaces]]
 binding = "COMPRESSLY_STATS"
 id = "add246b862564e07a8dcc43de5b38c78"
