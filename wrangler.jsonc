@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "worker",
+  // ...
+  "kv_namespaces": [
+    {
+      "binding": "COMPRESSLY_STATS",
+      "id": "add246b862564e07a8dcc43de5b38c78",
+    },
+  ],
+}
