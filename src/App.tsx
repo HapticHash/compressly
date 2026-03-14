@@ -257,13 +257,17 @@ export default function App() {
           fileItem.file.type.startsWith("image/") &&
           fileItem.file.type !== "image/svg+xml"
         ) {
+          // Undershoot by 25% for custom sizes to guarantee it stays under the target
+          const targetMB = (fileItem.originalSize * ratio) / (1024 * 1024);
+          const safeTargetMB =
+            compressionLevel === "Custom" ? targetMB * 0.75 : targetMB;
+
           const options = {
-            maxSizeMB: Math.max(
-              (fileItem.originalSize * ratio) / (1024 * 1024),
-              0.01,
-            ),
-            maxWidthOrHeight: 1920,
+            maxSizeMB: Math.max(safeTargetMB, 0.01),
+            alwaysKeepResolution: true,
             useWebWorker: true,
+            maxIteration: 30,
+            initialQuality: compressionLevel === "Custom" ? 0.6 : 0.8,
             onProgress: (progress: number) => {
               setFiles((prev) =>
                 prev.map((f) =>
@@ -306,9 +310,17 @@ export default function App() {
           if (isVideo) {
             let crf = "28";
             if (compressionLevel === "Low") crf = "23";
-            if (compressionLevel === "Medium") crf = "28";
-            if (compressionLevel === "High") crf = "32";
-            if (compressionLevel === "Extreme") crf = "36";
+            else if (compressionLevel === "Medium") crf = "28";
+            else if (compressionLevel === "High") crf = "32";
+            else if (compressionLevel === "Extreme") crf = "36";
+            else if (compressionLevel === "Custom") {
+              // More aggressive CRF calculation to ensure it hits the target size
+              const calculatedCrf = Math.min(
+                51,
+                Math.max(18, Math.round(51 - ratio * 33)),
+              );
+              crf = calculatedCrf.toString();
+            }
             args = [
               "-i",
               inputName,
@@ -323,9 +335,14 @@ export default function App() {
           } else {
             let bitrate = "128k";
             if (compressionLevel === "Low") bitrate = "192k";
-            if (compressionLevel === "Medium") bitrate = "128k";
-            if (compressionLevel === "High") bitrate = "64k";
-            if (compressionLevel === "Extreme") bitrate = "32k";
+            else if (compressionLevel === "Medium") bitrate = "128k";
+            else if (compressionLevel === "High") bitrate = "64k";
+            else if (compressionLevel === "Extreme") bitrate = "32k";
+            else if (compressionLevel === "Custom") {
+              // Undershoot audio bitrate by 25% to be safe
+              const kbps = Math.max(16, Math.round(256 * ratio * 0.75));
+              bitrate = `${kbps}k`;
+            }
             args = ["-i", inputName, "-b:a", bitrate, outputName];
           }
 
@@ -368,8 +385,8 @@ export default function App() {
               targetBytes / fileItem.originalSize,
               0.9,
             );
-            scale = Math.max(0.5, targetRatio * 2.0);
-            quality = Math.max(0.1, targetRatio);
+            scale = Math.max(0.3, targetRatio * 1.5);
+            quality = Math.max(0.05, targetRatio * 0.7);
           }
 
           for (let i = 1; i <= pdf.numPages; i++) {
