@@ -15,6 +15,14 @@ Compressly is a **privacy-first file compression tool** that lets you reduce fil
 
 ---
 
+## Screenshots
+
+![Compressly - Main screen | haptichash](https://raw.githubusercontent.com/HapticHash/compressly/refs/heads/master/public/assets/compressly_screenshot1.png)
+![Compressly - Files upload screen | haptichash](https://raw.githubusercontent.com/HapticHash/compressly/refs/heads/master/public/assets/compressly_screenshot2.png)
+![Compressly - Files compressed screen | haptichash](https://raw.githubusercontent.com/HapticHash/compressly/refs/heads/master/public/assets/compressly_screenshot3.png)
+
+---
+
 ## ✨ Features
 
 - **🎚️ Compression Level Control** — Choose how aggressively to compress, from lossless to maximum reduction.
