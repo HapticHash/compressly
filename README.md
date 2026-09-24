@@ -39,8 +39,8 @@ Compressly is a **privacy-first file compression tool** that lets you reduce fil
 | Layer         | Technology                               |
 | ------------- | ---------------------------------------- |
 | Frontend      | TypeScript, Vite, HTML/CSS               |
-| API / Backend | Cloudflare Workers (via `functions/api`) |
-| Deployment    | Cloudflare Pages                         |
+| API / Backend | Cloudflare Workers (via `worker/`)         |
+| Deployment    | Cloudflare Workers (static assets)       |
 | Config        | `wrangler.toml` for Cloudflare settings  |
 
 ---
@@ -86,22 +86,23 @@ The output will be in the `dist/` folder.
 
 ---
 
-## ☁️ Deployment (Cloudflare Pages)
+## ☁️ Deployment (Cloudflare Workers)
 
-Compressly is designed to deploy on **Cloudflare Pages** with **Cloudflare Workers** handling the API routes.
+Compressly deploys as a **Cloudflare Worker with static assets**: the Vite build in `dist/` is served as static files, and `/api/*` requests are handled by the Worker in `worker/`. Configuration lives in `wrangler.toml`.
 
 ```bash
-# Install Wrangler CLI globally (if you haven't already)
-npm install -g wrangler
-
-# Authenticate with Cloudflare
-wrangler login
-
-# Deploy
-wrangler pages deploy dist
+npm run build
+npx wrangler deploy
 ```
 
-The `functions/api` directory is automatically picked up by Cloudflare Pages as serverless API routes.
+With Workers Builds (Git integration), use `npm run build` as the build command and `npx wrangler deploy` (or `npx wrangler versions upload`) as the deploy command.
+
+To run the production setup locally, including the API and KV stats:
+
+```bash
+npm run build
+npx wrangler dev
+```
 
 ---
 
@@ -111,15 +112,14 @@ The `functions/api` directory is automatically picked up by Cloudflare Pages as 
 compressly/
 ├── docs/
 │   └── screenshots/  # README images (not deployed)
-├── functions/
-│   └── api/          # Cloudflare Worker API routes
+├── worker/           # Cloudflare Worker: /api/* routes
 ├── public/           # Static assets
 ├── src/
 │   ├── components/   # UI components
 │   └── lib/          # Compression logic, loaded on demand per file type
 ├── index.html        # App entry point
 ├── vite.config.ts    # Vite configuration
-├── wrangler.toml     # Cloudflare Workers/Pages config
+├── wrangler.toml     # Cloudflare Worker config
 └── package.json
 ```
 
@@ -133,7 +133,7 @@ Compressly is built with privacy as a core principle:
 - **No tracking** — No analytics or telemetry are attached to your files.
 - **Edge processing** — API functions run on Cloudflare's edge network, meaning processing happens ephemerally and close to you.
 
-You can verify this by inspecting the source code in `functions/api` and `src/`.
+You can verify this by inspecting the source code in `worker/` and `src/`.
 
 ---
 

@@ -34,9 +34,9 @@ async function readStats(kv: any): Promise<Stats> {
   };
 }
 
-export async function onRequestGet(context: any) {
+export async function handleStatsGet(env: any) {
   try {
-    const stats = await readStats(context.env.COMPRESSLY_STATS);
+    const stats = await readStats(env.COMPRESSLY_STATS);
     return json(stats, {
       headers: {
         'Access-Control-Allow-Origin': '*',
@@ -50,8 +50,7 @@ export async function onRequestGet(context: any) {
 
 // Note: KV has no atomic increment, so concurrent reports can still overwrite
 // each other. A Durable Object or D1 counter is needed for exact totals.
-export async function onRequestPost(context: any) {
-  const { request, env } = context;
+export async function handleStatsPost(request: Request, env: any) {
   let body: any;
   try {
     body = await request.json();
