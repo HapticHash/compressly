@@ -17,9 +17,9 @@ Compressly is a **privacy-first file compression tool** that lets you reduce fil
 
 ## Screenshots
 
-![Compressly - Main screen | haptichash](https://raw.githubusercontent.com/HapticHash/compressly/refs/heads/master/public/assets/compressly_screenshot1.png)
-![Compressly - Files upload screen | haptichash](https://raw.githubusercontent.com/HapticHash/compressly/refs/heads/master/public/assets/compressly_screenshot2.png)
-![Compressly - Files compressed screen | haptichash](https://raw.githubusercontent.com/HapticHash/compressly/refs/heads/master/public/assets/compressly_screenshot3.png)
+![Compressly - Main screen | haptichash](docs/screenshots/compressly_screenshot1.png)
+![Compressly - Files upload screen | haptichash](docs/screenshots/compressly_screenshot2.png)
+![Compressly - Files compressed screen | haptichash](docs/screenshots/compressly_screenshot3.png)
 
 ---
 
@@ -67,7 +67,14 @@ npm install
 npm run dev
 ```
 
-The app will be available at `http://localhost:5173` by default.
+The app will be available at `http://localhost:3000` by default.
+
+### Checks
+
+```bash
+npm run lint   # type-check
+npm test       # unit tests
+```
 
 ### Building for Production
 
@@ -102,10 +109,14 @@ The `functions/api` directory is automatically picked up by Cloudflare Pages as 
 
 ```
 compressly/
+├── docs/
+│   └── screenshots/  # README images (not deployed)
 ├── functions/
 │   └── api/          # Cloudflare Worker API routes
 ├── public/           # Static assets
-├── src/              # Frontend source (TypeScript)
+├── src/
+│   ├── components/   # UI components
+│   └── lib/          # Compression logic, loaded on demand per file type
 ├── index.html        # App entry point
 ├── vite.config.ts    # Vite configuration
 ├── wrangler.toml     # Cloudflare Workers/Pages config

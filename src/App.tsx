@@ -1,113 +1,203 @@
-import React, { useState, useCallback, useRef, useEffect } from "react";
+import React, { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   UploadCloud,
-  File,
-  Image as ImageIcon,
-  FileText,
-  Video,
-  Music,
   Settings,
-  CheckCircle,
   X,
   Download,
   ArrowRight,
   Activity,
   HardDrive,
-  FileCode,
-  FileImage,
-  FileAudio,
 } from "lucide-react";
-import JSZip from "jszip";
-import * as pdfjsLib from "pdfjs-dist";
-// @ts-ignore
-import pdfWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
-import imageCompression from "browser-image-compression";
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
-import { PDFDocument } from "pdf-lib";
+import { FileRow, type FileItem } from "./components/FileRow";
+import { FloatingBadges } from "./components/FloatingBadges";
+import {
+  compressFile,
+  createZip,
+  downloadBlob,
+  getFileKind,
+} from "./lib/compress";
+import {
+  type CompressionLevel,
+  type CompressionSettings,
+  LEVELS,
+  dedupeNames,
+  estimateSavings,
+  formatSize,
+  getOutputName,
+  isSettingsValid,
+  parseTargetMB,
+} from "./lib/settings";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+/** Files compressed in parallel. FFmpeg jobs are still serialized internally. */
+const CONCURRENCY = 3;
 
-type CompressionLevel = "Low" | "Medium" | "High" | "Extreme" | "Custom";
+type CompressionScope = "all" | "new" | "old";
 
-interface FileItem {
-  id: string;
-  file: File;
-  status: "idle" | "compressing" | "done" | "error";
-  progress: number;
-  originalSize: number;
-  compressedSize?: number;
-  previewUrl?: string;
-  compressedBlob?: Blob | File;
+function createId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+}
+
+function isInScope(f: FileItem, scope: CompressionScope): boolean {
+  if (f.status === "compressing" || f.status === "unsupported") return false;
+  if (scope === "new") return f.status === "idle";
+  if (scope === "old") return f.status === "done";
+  return true;
+}
+
+async function runPool<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+) {
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) await worker(items[next++]);
+    }),
+  );
 }
 
 export default function App() {
-  const [isLoaded, setIsLoaded] = useState(false);
   const [files, setFiles] = useState<FileItem[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [compressionLevel, setCompressionLevel] =
     useState<CompressionLevel>("Medium");
   const [targetSize, setTargetSize] = useState<string>("");
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const ffmpegRef = useRef(new FFmpeg());
+
+  // Mirrors `files` so async handlers always see the latest list.
+  const filesRef = useRef(files);
+  filesRef.current = files;
 
   // Global Stats
   const [totalFilesCompressed, setTotalFilesCompressed] = useState(0);
   const [totalDataSaved, setTotalDataSaved] = useState(0); // in bytes
   const [isSystemActive, setIsSystemActive] = useState(true);
 
-  const loadFFmpeg = async () => {
-    const ffmpeg = ffmpegRef.current;
-    if (ffmpeg.loaded) return;
-    try {
-      const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
-      await ffmpeg.load({
-        coreURL: await toBlobURL(
-          `${baseURL}/ffmpeg-core.js`,
-          "text/javascript",
-        ),
-        wasmURL: await toBlobURL(
-          `${baseURL}/ffmpeg-core.wasm`,
-          "application/wasm",
-        ),
-      });
-    } catch (e) {
-      console.error("Failed to load FFmpeg", e);
-    }
-  };
+  const settings: CompressionSettings = useMemo(
+    () => ({ level: compressionLevel, targetBytes: parseTargetMB(targetSize) }),
+    [compressionLevel, targetSize],
+  );
+  const settingsValid = isSettingsValid(settings);
 
-  const fetchStats = async () => {
-    try {
-      const res = await fetch("/api/stats");
-      if (res.ok) {
-        const data = await res.json();
-        setTotalFilesCompressed(data.totalFilesCompressed || 0);
-        setTotalDataSaved(data.totalDataSaved || 0);
-      }
-    } catch (e) {
-      console.error("Failed to fetch stats", e);
-    }
-  };
+  // Progress events arrive many times per second; batch them into one
+  // state update per animation frame.
+  const pendingProgress = useRef(new Map<string, number>());
+  const progressFrame = useRef<number | null>(null);
 
-  const checkHealth = async () => {
-    try {
-      const res = await fetch("/api/health");
-      setIsSystemActive(res.ok);
-    } catch (e) {
-      setIsSystemActive(false);
-    }
-  };
+  const setProgress = useCallback((id: string, progress: number) => {
+    pendingProgress.current.set(id, progress);
+    if (progressFrame.current !== null) return;
+    progressFrame.current = requestAnimationFrame(() => {
+      progressFrame.current = null;
+      const updates = new Map(pendingProgress.current);
+      pendingProgress.current.clear();
+      setFiles((prev) =>
+        prev.map((f) =>
+          updates.has(f.id) && f.status === "compressing"
+            ? { ...f, progress: updates.get(f.id)! }
+            : f,
+        ),
+      );
+    });
+  }, []);
 
   useEffect(() => {
-    setIsLoaded(true);
-    loadFFmpeg();
+    const fetchStats = async () => {
+      try {
+        const res = await fetch("/api/stats");
+        if (res.ok) {
+          const data = await res.json();
+          setTotalFilesCompressed(data.totalFilesCompressed || 0);
+          setTotalDataSaved(data.totalDataSaved || 0);
+        }
+      } catch (e) {
+        console.error("Failed to fetch stats", e);
+      }
+    };
+
+    const checkHealth = async () => {
+      try {
+        const res = await fetch("/api/health");
+        setIsSystemActive(res.ok);
+      } catch (e) {
+        setIsSystemActive(false);
+      }
+    };
+
+    // Re-check when the tab regains focus instead of polling in the background.
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") checkHealth();
+    };
+
     fetchStats();
     checkHealth();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (progressFrame.current !== null)
+        cancelAnimationFrame(progressFrame.current);
+    };
+  }, []);
 
-    // Poll health every 30 seconds
-    const interval = setInterval(checkHealth, 30000);
-    return () => clearInterval(interval);
+  // Release preview object URLs when the app unmounts.
+  useEffect(
+    () => () =>
+      filesRef.current.forEach(
+        (f) => f.previewUrl && URL.revokeObjectURL(f.previewUrl),
+      ),
+    [],
+  );
+
+  const addFiles = useCallback((newFiles: File[]) => {
+    const newItems: FileItem[] = newFiles.map((f) => {
+      const kind = getFileKind(f);
+      return {
+        id: createId(),
+        file: f,
+        status: kind ? "idle" : "unsupported",
+        progress: 0,
+        originalSize: f.size,
+        previewUrl:
+          kind === "image" || kind === "svg" || f.type.startsWith("video/")
+            ? URL.createObjectURL(f)
+            : undefined,
+      };
+    });
+    setFiles((prev) => [...prev, ...newItems]);
+
+    // Start downloading FFmpeg as soon as it's needed, not on page load.
+    if (newItems.some((item) => getFileKind(item.file) === "media")) {
+      import("./lib/media")
+        .then((m) => m.loadFFmpeg())
+        .catch((e) => console.error("Failed to load FFmpeg", e));
+    }
+
+    const pdfs = newItems.filter((item) => getFileKind(item.file) === "pdf");
+    if (pdfs.length > 0) {
+      import("./lib/pdf").then(({ generatePdfThumbnail }) =>
+        pdfs.forEach(async (item) => {
+          try {
+            const thumbUrl = await generatePdfThumbnail(item.file);
+            // The file may have been removed while the thumbnail rendered.
+            if (!filesRef.current.some((f) => f.id === item.id)) {
+              URL.revokeObjectURL(thumbUrl);
+              return;
+            }
+            setFiles((prev) =>
+              prev.map((f) =>
+                f.id === item.id ? { ...f, previewUrl: thumbUrl } : f,
+              ),
+            );
+          } catch (error) {
+            console.error("Error generating PDF thumbnail:", error);
+          }
+        }),
+      );
+    }
   }, []);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -117,79 +207,34 @@ export default function App() {
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault();
+    // Ignore leave events fired when moving over child elements.
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
     setIsDragging(false);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      addFiles(Array.from(e.dataTransfer.files));
-    }
-  }, []);
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragging(false);
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        addFiles(Array.from(e.dataTransfer.files));
+      }
+    },
+    [addFiles],
+  );
 
   const handleFileInput = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       if (e.target.files && e.target.files.length > 0) {
         addFiles(Array.from(e.target.files));
       }
+      // Allow selecting the same file again.
+      e.target.value = "";
     },
-    [],
+    [addFiles],
   );
 
-  const generatePdfThumbnail = async (
-    file: File,
-  ): Promise<string | undefined> => {
-    try {
-      const arrayBuffer = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      const page = await pdf.getPage(1);
-      const viewport = page.getViewport({ scale: 1 });
-
-      const canvas = document.createElement("canvas");
-      const context = canvas.getContext("2d");
-      if (!context) return undefined;
-
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-
-      await page.render({ canvasContext: context, viewport } as any).promise;
-      return canvas.toDataURL("image/jpeg", 0.8);
-    } catch (error) {
-      console.error("Error generating PDF thumbnail:", error);
-      return undefined;
-    }
-  };
-
-  const addFiles = (newFiles: File[]) => {
-    const newItems: FileItem[] = newFiles.map((f) => ({
-      id: Math.random().toString(36).substring(7),
-      file: f,
-      status: "idle",
-      progress: 0,
-      originalSize: f.size,
-      previewUrl:
-        f.type.startsWith("image/") || f.type.startsWith("video/")
-          ? URL.createObjectURL(f)
-          : undefined,
-    }));
-    setFiles((prev) => [...prev, ...newItems]);
-
-    newItems.forEach(async (item) => {
-      if (item.file.type === "application/pdf") {
-        const thumbUrl = await generatePdfThumbnail(item.file);
-        if (thumbUrl) {
-          setFiles((prev) =>
-            prev.map((f) =>
-              f.id === item.id ? { ...f, previewUrl: thumbUrl } : f,
-            ),
-          );
-        }
-      }
-    });
-  };
-
-  const removeFile = (id: string) => {
+  const removeFile = useCallback((id: string) => {
     setFiles((prev) => {
       const fileToRemove = prev.find((f) => f.id === id);
       if (fileToRemove?.previewUrl) {
@@ -197,286 +242,86 @@ export default function App() {
       }
       return prev.filter((f) => f.id !== id);
     });
-  };
+  }, []);
 
-  const formatSize = (bytes: number) => {
-    if (bytes === 0) return "0 B";
-    const k = 1024;
-    const sizes = ["B", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
-  };
+  const downloadFile = useCallback((id: string) => {
+    const item = filesRef.current.find((f) => f.id === id);
+    if (!item) return;
+    const blob = item.compressedBlob || item.file;
+    downloadBlob(blob, getOutputName(item.file.name, blob.type));
+  }, []);
 
-  const getFileIcon = (type: string) => {
-    if (type.startsWith("image/"))
-      return <ImageIcon className="w-6 h-6 text-primary" />;
-    if (type.startsWith("video/"))
-      return <Video className="w-6 h-6 text-accent" />;
-    if (type.startsWith("audio/"))
-      return <Music className="w-6 h-6 text-accent-light" />;
-    if (type === "application/pdf")
-      return <FileText className="w-6 h-6 text-accent" />;
-    return <File className="w-6 h-6 text-text-muted" />;
-  };
+  const handleCompression = async (scope: CompressionScope = "all") => {
+    if (!settingsValid) return;
+    const selected = filesRef.current.filter((f) => isInScope(f, scope));
+    if (selected.length === 0) return;
 
-  const handleCompression = async (type: "all" | "new" | "old" = "all") => {
+    const ids = new Set(selected.map((f) => f.id));
     setFiles((prev) =>
-      prev.map((f) => {
-        if (f.status === "compressing") return f;
-        if (type === "new" && f.status !== "idle") return f;
-        if (type === "old" && f.status !== "done") return f;
-        return { ...f, status: "compressing", progress: 0 };
-      }),
+      prev.map((f) =>
+        ids.has(f.id)
+          ? {
+              ...f,
+              status: "compressing",
+              progress: 0,
+              compressedSize: undefined,
+              compressedBlob: undefined,
+              keptOriginal: false,
+            }
+          : f,
+      ),
     );
 
-    // We need to get the latest files state, but since we just updated it,
-    // we'll filter the current files array for non-compressing ones to process.
-    const filesToCompress = files.filter((f) => {
-      if (f.status === "compressing") return false;
-      if (type === "new" && f.status !== "idle") return false;
-      if (type === "old" && f.status !== "done") return false;
-      return true;
-    });
+    let filesCount = 0;
+    let bytesSaved = 0;
 
-    for (const fileItem of filesToCompress) {
+    await runPool(selected, CONCURRENCY, async (fileItem: FileItem) => {
       try {
-        let compressedFile: File | Blob = fileItem.file;
-        let compressedSize = fileItem.originalSize;
-        let ratio = 0.5;
-
-        if (compressionLevel === "Low") ratio = 0.8;
-        if (compressionLevel === "Medium") ratio = 0.5;
-        if (compressionLevel === "High") ratio = 0.3;
-        if (compressionLevel === "Extreme") ratio = 0.15;
-        if (compressionLevel === "Custom" && targetSize) {
-          const targetBytes = parseFloat(targetSize) * 1024 * 1024;
-          ratio = Math.min(targetBytes / fileItem.originalSize, 0.9);
-        }
-
-        if (
-          fileItem.file.type.startsWith("image/") &&
-          fileItem.file.type !== "image/svg+xml"
-        ) {
-          // Undershoot by 25% for custom sizes to guarantee it stays under the target
-          const targetMB = (fileItem.originalSize * ratio) / (1024 * 1024);
-          const safeTargetMB =
-            compressionLevel === "Custom" ? targetMB * 0.75 : targetMB;
-
-          const options = {
-            maxSizeMB: Math.max(safeTargetMB, 0.01),
-            alwaysKeepResolution: true,
-            useWebWorker: true,
-            maxIteration: 30,
-            initialQuality: compressionLevel === "Custom" ? 0.6 : 0.8,
-            onProgress: (progress: number) => {
-              setFiles((prev) =>
-                prev.map((f) =>
-                  f.id === fileItem.id ? { ...f, progress } : f,
-                ),
-              );
-            },
-          };
-
-          compressedFile = await imageCompression(fileItem.file, options);
-          compressedSize = compressedFile.size;
-        } else if (
-          fileItem.file.type.startsWith("video/") ||
-          fileItem.file.type.startsWith("audio/")
-        ) {
-          const ffmpeg = ffmpegRef.current;
-          if (!ffmpeg.loaded) await loadFFmpeg();
-
-          const isVideo = fileItem.file.type.startsWith("video/");
-          const ext = isVideo ? "mp4" : "mp3";
-          const inputName = `input_${fileItem.id}.${ext}`;
-          const outputName = `output_${fileItem.id}.${ext}`;
-
-          await ffmpeg.writeFile(inputName, await fetchFile(fileItem.file));
-
-          ffmpeg.on("progress", ({ progress }) => {
-            setFiles((prev) =>
-              prev.map((f) =>
-                f.id === fileItem.id
-                  ? {
-                      ...f,
-                      progress: Math.min(Math.round(progress * 100), 100),
-                    }
-                  : f,
-              ),
-            );
-          });
-
-          let args: string[] = [];
-          if (isVideo) {
-            let crf = "28";
-            if (compressionLevel === "Low") crf = "23";
-            else if (compressionLevel === "Medium") crf = "28";
-            else if (compressionLevel === "High") crf = "32";
-            else if (compressionLevel === "Extreme") crf = "36";
-            else if (compressionLevel === "Custom") {
-              // More aggressive CRF calculation to ensure it hits the target size
-              const calculatedCrf = Math.min(
-                51,
-                Math.max(18, Math.round(51 - ratio * 33)),
-              );
-              crf = calculatedCrf.toString();
-            }
-            args = [
-              "-i",
-              inputName,
-              "-vcodec",
-              "libx264",
-              "-crf",
-              crf,
-              "-preset",
-              "ultrafast",
-              outputName,
-            ];
-          } else {
-            let bitrate = "128k";
-            if (compressionLevel === "Low") bitrate = "192k";
-            else if (compressionLevel === "Medium") bitrate = "128k";
-            else if (compressionLevel === "High") bitrate = "64k";
-            else if (compressionLevel === "Extreme") bitrate = "32k";
-            else if (compressionLevel === "Custom") {
-              // Undershoot audio bitrate by 25% to be safe
-              const kbps = Math.max(16, Math.round(256 * ratio * 0.75));
-              bitrate = `${kbps}k`;
-            }
-            args = ["-i", inputName, "-b:a", bitrate, outputName];
-          }
-
-          await ffmpeg.exec(args);
-          const data = await ffmpeg.readFile(outputName);
-          compressedFile = new Blob([(data as Uint8Array).buffer], {
-            type: isVideo ? "video/mp4" : "audio/mpeg",
-          });
-          compressedSize = compressedFile.size;
-
-          await ffmpeg.deleteFile(inputName);
-          await ffmpeg.deleteFile(outputName);
-          ffmpeg.off("progress", () => {});
-        } else if (fileItem.file.type === "application/pdf") {
-          const arrayBuffer = await fileItem.file.arrayBuffer();
-          const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-          const newPdf = await PDFDocument.create();
-
-          let scale = 1.5;
-          let quality = 0.6;
-          if (compressionLevel === "Low") {
-            scale = 2.0;
-            quality = 0.8;
-          }
-          if (compressionLevel === "Medium") {
-            scale = 1.5;
-            quality = 0.6;
-          }
-          if (compressionLevel === "High") {
-            scale = 1.0;
-            quality = 0.5;
-          }
-          if (compressionLevel === "Extreme") {
-            scale = 0.8;
-            quality = 0.4;
-          }
-          if (compressionLevel === "Custom" && targetSize) {
-            const targetBytes = parseFloat(targetSize) * 1024 * 1024;
-            const targetRatio = Math.min(
-              targetBytes / fileItem.originalSize,
-              0.9,
-            );
-            scale = Math.max(0.3, targetRatio * 1.5);
-            quality = Math.max(0.05, targetRatio * 0.7);
-          }
-
-          for (let i = 1; i <= pdf.numPages; i++) {
-            const page = await pdf.getPage(i);
-            const viewport = page.getViewport({ scale });
-
-            const canvas = document.createElement("canvas");
-            const context = canvas.getContext("2d");
-            if (context) {
-              canvas.width = viewport.width;
-              canvas.height = viewport.height;
-
-              await page.render({ canvasContext: context, viewport } as any)
-                .promise;
-
-              const imgData = canvas.toDataURL("image/jpeg", quality);
-              const imgBytes = await fetch(imgData).then((res) =>
-                res.arrayBuffer(),
-              );
-              const pdfImage = await newPdf.embedJpg(imgBytes);
-
-              const pdfPage = newPdf.addPage([viewport.width, viewport.height]);
-              pdfPage.drawImage(pdfImage, {
-                x: 0,
-                y: 0,
-                width: viewport.width,
-                height: viewport.height,
-              });
-            }
-
-            setFiles((prev) =>
-              prev.map((f) =>
-                f.id === fileItem.id
-                  ? { ...f, progress: Math.round((i / pdf.numPages) * 100) }
-                  : f,
-              ),
-            );
-          }
-
-          const pdfBytes = await newPdf.save();
-          compressedFile = new Blob([pdfBytes], { type: "application/pdf" });
-          compressedSize = compressedFile.size;
-        } else {
-          // Simulate progress for other unsupported files
-          for (let i = 0; i <= 100; i += 10) {
-            await new Promise((resolve) => setTimeout(resolve, 50));
-            setFiles((prev) =>
-              prev.map((f) =>
-                f.id === fileItem.id ? { ...f, progress: i } : f,
-              ),
-            );
-          }
-          compressedSize = fileItem.originalSize;
-        }
-
-        setFiles((prev) =>
-          prev.map((f) => {
-            if (f.id === fileItem.id) {
-              return {
-                ...f,
-                status: "done",
-                progress: 100,
-                compressedSize: compressedSize,
-                compressedBlob: compressedFile,
-              };
-            }
-            return f;
-          }),
+        const { blob, keptOriginal } = await compressFile(
+          fileItem.file,
+          fileItem.id,
+          settings,
+          (progress) => setProgress(fileItem.id, progress),
         );
-
-        const saved = Math.max(0, fileItem.originalSize - compressedSize);
-        setTotalFilesCompressed((prev) => prev + 1);
-        setTotalDataSaved((prev) => prev + saved);
-
-        // Update global stats
-        if (saved > 0) {
-          fetch("/api/stats", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ filesCount: 1, bytesSaved: saved }),
-          }).catch(console.error);
+        pendingProgress.current.delete(fileItem.id);
+        setFiles((prev) =>
+          prev.map((f) =>
+            f.id === fileItem.id
+              ? {
+                  ...f,
+                  status: "done",
+                  progress: 100,
+                  compressedSize: blob.size,
+                  compressedBlob: blob,
+                  keptOriginal,
+                }
+              : f,
+          ),
+        );
+        if (!keptOriginal) {
+          filesCount += 1;
+          bytesSaved += fileItem.originalSize - blob.size;
         }
       } catch (error) {
         console.error("Compression error:", error);
+        pendingProgress.current.delete(fileItem.id);
         setFiles((prev) =>
           prev.map((f) =>
             f.id === fileItem.id ? { ...f, status: "error" } : f,
           ),
         );
       }
+    });
+
+    if (filesCount > 0) {
+      setTotalFilesCompressed((prev) => prev + filesCount);
+      setTotalDataSaved((prev) => prev + bytesSaved);
+      // One request per batch instead of one per file.
+      fetch("/api/stats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filesCount, bytesSaved }),
+      }).catch(console.error);
     }
   };
 
@@ -484,130 +329,46 @@ export default function App() {
     const doneFiles = files.filter((f) => f.status === "done");
     if (doneFiles.length === 0) return;
 
-    const zip = new JSZip();
-    doneFiles.forEach((f) => {
-      zip.file(`compressed_${f.file.name}`, f.compressedBlob || f.file);
-    });
-
-    const content = await zip.generateAsync({ type: "blob" });
-    const url = URL.createObjectURL(content);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `compressly_${Date.now()}.zip`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const getEstimatedSavings = () => {
-    const pendingFiles = files.filter((f) => f.status !== "compressing");
-    if (pendingFiles.length === 0) return null;
-
-    const totalOriginal = pendingFiles.reduce(
-      (acc, f) => acc + f.originalSize,
-      0,
+    const blobs = doneFiles.map((f) => f.compressedBlob || f.file);
+    const names = dedupeNames(
+      doneFiles.map((f, i) => getOutputName(f.file.name, blobs[i].type)),
     );
-    let ratio = 0.5;
-    if (compressionLevel === "Low") ratio = 0.8;
-    if (compressionLevel === "Medium") ratio = 0.5;
-    if (compressionLevel === "High") ratio = 0.3;
-    if (compressionLevel === "Extreme") ratio = 0.15;
-    if (compressionLevel === "Custom" && targetSize) {
-      const targetBytes = parseFloat(targetSize) * 1024 * 1024;
-      ratio = Math.min(targetBytes / totalOriginal, 0.9);
-    } else if (compressionLevel === "Custom") {
-      return null;
-    }
-
-    const estimatedSaved = totalOriginal - totalOriginal * ratio;
-    const percentage = Math.round((1 - ratio) * 100);
-
-    return { saved: estimatedSaved, percentage };
+    const zip = await createZip(
+      names.map((name, i) => ({ name, blob: blobs[i] })),
+    );
+    downloadBlob(zip, `compressly_${Date.now()}.zip`);
   };
 
-  const estimate = getEstimatedSavings();
+  const clearQueue = () => {
+    files.forEach((f) => f.previewUrl && URL.revokeObjectURL(f.previewUrl));
+    setFiles([]);
+  };
+
+  const compressible = files.filter((f) => f.status !== "unsupported");
+  const isBusy =
+    compressible.length === 0 ||
+    compressible.every((f) => f.status === "compressing") ||
+    !settingsValid;
+
+  const estimate = useMemo(
+    () =>
+      estimateSavings(
+        files
+          .filter((f) => isInScope(f, "all"))
+          .map((f) => f.originalSize),
+        settings,
+      ),
+    [files, settings],
+  );
 
   return (
     <div className="min-h-screen flex flex-col items-center py-16 px-4 sm:px-6 lg:px-8 relative overflow-hidden selection:bg-primary/30">
-      {/* Decorative Background Elements */}
-      <div className="absolute top-[-20%] left-[-10%] w-[60vw] h-[60vw] rounded-full bg-primary/10 blur-[120px] pointer-events-none" />
-      <div className="absolute bottom-[-20%] right-[-10%] w-[60vw] h-[60vw] rounded-full bg-accent/10 blur-[120px] pointer-events-none" />
+      {/* Decorative Background Elements (gradients instead of costly blur filters) */}
+      <div className="absolute top-[-20%] left-[-10%] w-[60vw] h-[60vw] rounded-full bg-[radial-gradient(circle,rgb(96_108_56/0.12)_0%,transparent_70%)] pointer-events-none" />
+      <div className="absolute bottom-[-20%] right-[-10%] w-[60vw] h-[60vw] rounded-full bg-[radial-gradient(circle,rgb(188_108_37/0.12)_0%,transparent_70%)] pointer-events-none" />
 
       {/* Subtle Decorative Icons */}
-      {isLoaded && (
-        <>
-          <motion.div
-            initial={{ opacity: 0, y: 20, rotate: -12 }}
-            animate={{ opacity: 1, y: 0, rotate: -10 }}
-            transition={{ duration: 1, ease: "easeOut" }}
-            className="absolute top-24 left-[8%] hidden lg:flex flex-col items-center justify-center w-20 h-24 bg-surface/80 backdrop-blur-md shadow-xl shadow-black/5 rounded-2xl border border-border pointer-events-none z-0"
-          >
-            <FileText className="w-8 h-8 text-red-400 mb-2" />
-            <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider">
-              PDF
-            </span>
-          </motion.div>
-
-          <motion.div
-            initial={{ opacity: 0, y: -20, rotate: 15 }}
-            animate={{ opacity: 1, y: 0, rotate: 12 }}
-            transition={{ duration: 1, delay: 0.2, ease: "easeOut" }}
-            className="absolute top-32 right-[10%] hidden lg:flex flex-col items-center justify-center w-20 h-24 bg-surface/80 backdrop-blur-md shadow-xl shadow-black/5 rounded-2xl border border-border pointer-events-none z-0"
-          >
-            <ImageIcon className="w-8 h-8 text-blue-400 mb-2" />
-            <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider">
-              JPG
-            </span>
-          </motion.div>
-
-          <motion.div
-            initial={{ opacity: 0, x: -20, rotate: -5 }}
-            animate={{ opacity: 1, x: 0, rotate: -8 }}
-            transition={{ duration: 1, delay: 0.4, ease: "easeOut" }}
-            className="absolute top-72 left-[15%] hidden xl:flex flex-col items-center justify-center w-20 h-24 bg-surface/80 backdrop-blur-md shadow-xl shadow-black/5 rounded-2xl border border-border pointer-events-none z-0"
-          >
-            <FileCode className="w-8 h-8 text-orange-400 mb-2" />
-            <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider">
-              SVG
-            </span>
-          </motion.div>
-
-          <motion.div
-            initial={{ opacity: 0, x: 20, rotate: 8 }}
-            animate={{ opacity: 1, x: 0, rotate: 10 }}
-            transition={{ duration: 1, delay: 0.6, ease: "easeOut" }}
-            className="absolute top-64 right-[18%] hidden xl:flex flex-col items-center justify-center w-20 h-24 bg-surface/80 backdrop-blur-md shadow-xl shadow-black/5 rounded-2xl border border-border pointer-events-none z-0"
-          >
-            <Video className="w-8 h-8 text-purple-400 mb-2" />
-            <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider">
-              MP4
-            </span>
-          </motion.div>
-
-          <motion.div
-            initial={{ opacity: 0, y: 20, rotate: 20 }}
-            animate={{ opacity: 1, y: 0, rotate: 18 }}
-            transition={{ duration: 1, delay: 0.8, ease: "easeOut" }}
-            className="absolute top-[28rem] left-[12%] hidden 2xl:flex flex-col items-center justify-center w-20 h-24 bg-surface/80 backdrop-blur-md shadow-xl shadow-black/5 rounded-2xl border border-border pointer-events-none z-0"
-          >
-            <FileImage className="w-8 h-8 text-emerald-400 mb-2" />
-            <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider">
-              GIF
-            </span>
-          </motion.div>
-
-          <motion.div
-            initial={{ opacity: 0, y: -15, rotate: -15 }}
-            animate={{ opacity: 1, y: 0, rotate: -12 }}
-            transition={{ duration: 1, delay: 1.0, ease: "easeOut" }}
-            className="absolute top-[26rem] right-[15%] hidden 2xl:flex flex-col items-center justify-center w-20 h-24 bg-surface/80 backdrop-blur-md shadow-xl shadow-black/5 rounded-2xl border border-border pointer-events-none z-0"
-          >
-            <FileAudio className="w-8 h-8 text-pink-400 mb-2" />
-            <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider">
-              MP3
-            </span>
-          </motion.div>
-        </>
-      )}
+      <FloatingBadges />
 
       <div className="w-full max-w-4xl z-10 flex flex-col">
         {/* Header */}
@@ -650,7 +411,7 @@ export default function App() {
               className="hidden"
               ref={fileInputRef}
               onChange={handleFileInput}
-              accept="image/*,video/*,audio/*,.pdf,.svg"
+              accept="image/jpeg,image/png,image/webp,image/bmp,image/svg+xml,video/*,audio/*,application/pdf"
             />
             <div className="w-24 h-24 rounded-full bg-surface border border-border flex items-center justify-center mb-6 shadow-lg shadow-black/5">
               <UploadCloud
@@ -662,7 +423,7 @@ export default function App() {
               Drop your files here
             </h3>
             <p className="text-text-muted mb-8 text-lg">
-              Supports PDF, JPG, PNG, SVG, MP4, GIF, MP3
+              Supports PDF, JPG, PNG, WebP, SVG, MP4, MP3 and more
             </p>
             <button
               onClick={() => fileInputRef.current?.click()}
@@ -696,24 +457,25 @@ export default function App() {
                         <label className="block text-xs uppercase tracking-widest text-text-muted mb-3 font-semibold">
                           Level
                         </label>
-                        <div className="flex flex-wrap sm:flex-nowrap bg-bg rounded-2xl p-1 border border-border min-h-[3rem]">
-                          {["Low", "Medium", "High", "Extreme", "Custom"].map(
-                            (level) => (
-                              <button
-                                key={level}
-                                onClick={() =>
-                                  setCompressionLevel(level as CompressionLevel)
-                                }
-                                className={`flex-1 min-w-[30%] sm:min-w-0 h-10 sm:h-auto flex items-center justify-center px-2 sm:px-3 text-xs sm:text-sm rounded-xl transition-all duration-200 ${
-                                  compressionLevel === level
-                                    ? "bg-accent text-surface shadow-md font-medium"
-                                    : "text-text-muted hover:text-accent hover:bg-accent/10"
-                                }`}
-                              >
-                                {level}
-                              </button>
-                            ),
-                          )}
+                        <div
+                          role="group"
+                          aria-label="Compression level"
+                          className="flex flex-wrap sm:flex-nowrap bg-bg rounded-2xl p-1 border border-border min-h-[3rem]"
+                        >
+                          {LEVELS.map((level) => (
+                            <button
+                              key={level}
+                              onClick={() => setCompressionLevel(level)}
+                              aria-pressed={compressionLevel === level}
+                              className={`flex-1 min-w-[30%] sm:min-w-0 h-10 sm:h-auto flex items-center justify-center px-2 sm:px-3 text-xs sm:text-sm rounded-xl transition-all duration-200 ${
+                                compressionLevel === level
+                                  ? "bg-accent text-surface shadow-md font-medium"
+                                  : "text-text-muted hover:text-accent hover:bg-accent/10"
+                              }`}
+                            >
+                              {level}
+                            </button>
+                          ))}
                         </div>
                       </div>
 
@@ -725,16 +487,32 @@ export default function App() {
                             exit={{ opacity: 0, height: 0 }}
                             className="w-full overflow-hidden"
                           >
-                            <label className="block text-xs uppercase tracking-widest text-text-muted mb-3 font-semibold">
-                              Target (MB)
+                            <label
+                              htmlFor="target-size"
+                              className="block text-xs uppercase tracking-widest text-text-muted mb-3 font-semibold"
+                            >
+                              Target per file (MB)
                             </label>
                             <input
+                              id="target-size"
                               type="number"
+                              min="0"
+                              step="any"
                               value={targetSize}
                               onChange={(e) => setTargetSize(e.target.value)}
                               placeholder="e.g. 5"
+                              aria-invalid={!settingsValid}
+                              aria-describedby="target-size-hint"
                               className="w-full h-12 bg-bg border border-border rounded-2xl px-4 text-sm focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all text-text"
                             />
+                            {!settingsValid && (
+                              <p
+                                id="target-size-hint"
+                                className="mt-2 text-xs text-accent"
+                              >
+                                Enter a target size greater than 0.
+                              </p>
+                            )}
                           </motion.div>
                         )}
                       </AnimatePresence>
@@ -765,18 +543,14 @@ export default function App() {
                         <div className="flex flex-col gap-3 w-full sm:w-auto items-center">
                           <button
                             onClick={() => handleCompression("new")}
-                            disabled={files.every(
-                              (f) => f.status === "compressing",
-                            )}
+                            disabled={isBusy}
                             className="w-full sm:w-auto h-12 px-8 rounded-full bg-primary text-surface hover:bg-[#4a532b] hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap"
                           >
                             Compress New <ArrowRight className="w-4 h-4" />
                           </button>
                           <button
                             onClick={() => handleCompression("old")}
-                            disabled={files.every(
-                              (f) => f.status === "compressing",
-                            )}
+                            disabled={isBusy}
                             className="w-full sm:w-auto h-12 px-8 rounded-full bg-accent text-surface hover:bg-[#a65d1f] hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap"
                           >
                             Re-compress Old <ArrowRight className="w-4 h-4" />
@@ -785,15 +559,13 @@ export default function App() {
                       ) : (
                         <button
                           onClick={() => handleCompression("all")}
-                          disabled={
-                            files.length === 0 ||
-                            files.every((f) => f.status === "compressing")
-                          }
+                          disabled={isBusy}
                           className="w-full sm:w-auto h-12 px-8 rounded-full bg-primary text-surface hover:bg-[#4a532b] hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium"
                         >
-                          {files.every((f) => f.status === "done")
+                          {compressible.length > 0 &&
+                          compressible.every((f) => f.status === "done")
                             ? "Re-compress All"
-                            : files.length === 1
+                            : compressible.length === 1
                               ? "Compress"
                               : "Compress All"}{" "}
                           <ArrowRight className="w-4 h-4" />
@@ -819,13 +591,7 @@ export default function App() {
                         </button>
                       )}
                       <button
-                        onClick={() => {
-                          files.forEach(
-                            (f) =>
-                              f.previewUrl && URL.revokeObjectURL(f.previewUrl),
-                          );
-                          setFiles([]);
-                        }}
+                        onClick={clearQueue}
                         className="text-sm font-medium text-text-muted hover:text-red-500 flex items-center gap-1.5 transition-colors"
                       >
                         <X className="w-4 h-4" /> Clear Queue
@@ -834,102 +600,12 @@ export default function App() {
                   </div>
                   <AnimatePresence>
                     {files.map((file) => (
-                      <motion.div
+                      <FileRow
                         key={file.id}
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, scale: 0.95 }}
-                        className="bg-surface/40 backdrop-blur-md rounded-2xl p-3 sm:p-4 border border-border flex flex-row items-center gap-3 sm:gap-5 shadow-lg relative overflow-hidden"
-                      >
-                        {/* Progress Background */}
-                        {file.status === "compressing" && (
-                          <div
-                            className="absolute left-0 top-0 bottom-0 bg-[#dda15e]/30 transition-all duration-300 ease-out"
-                            style={{ width: `${file.progress}%` }}
-                          />
-                        )}
-
-                        <div className="w-20 h-20 sm:w-16 sm:h-16 rounded-xl bg-surface border border-border flex items-center justify-center shrink-0 z-10 overflow-hidden">
-                          {file.previewUrl ? (
-                            file.file.type.startsWith("video/") ? (
-                              <video
-                                src={`${file.previewUrl}#t=0.1`}
-                                className="w-full h-full object-cover"
-                                preload="metadata"
-                                muted
-                                playsInline
-                              />
-                            ) : (
-                              <img
-                                src={file.previewUrl}
-                                alt="preview"
-                                className="w-full h-full object-cover"
-                              />
-                            )
-                          ) : (
-                            getFileIcon(file.file.type)
-                          )}
-                        </div>
-
-                        <div className="flex-grow min-w-0 z-10 flex flex-col justify-center">
-                          <p className="text-sm sm:text-base font-medium text-text truncate mb-1">
-                            {file.file.name}
-                          </p>
-                          <div className="flex flex-col text-xs sm:text-sm text-text-muted gap-0.5">
-                            <span>
-                              Original: {formatSize(file.originalSize)}
-                            </span>
-                            {file.compressedSize && (
-                              <div className="flex items-center gap-2">
-                                <span className="text-text font-semibold">
-                                  New: {formatSize(file.compressedSize)}
-                                </span>
-                                <span className="text-[10px] sm:text-xs bg-primary/10 text-primary px-1.5 sm:px-2 py-0.5 rounded-md font-medium border border-primary/20">
-                                  -
-                                  {Math.round(
-                                    (1 -
-                                      file.compressedSize / file.originalSize) *
-                                      100,
-                                  )}
-                                  %
-                                </span>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="shrink-0 flex flex-col sm:flex-row items-center gap-2 sm:gap-3 z-10 self-center ml-auto">
-                          {file.status === "compressing" && (
-                            <span className="text-sm font-medium text-primary">
-                              {Math.round(file.progress)}%
-                            </span>
-                          )}
-                          {file.status === "done" && (
-                            <button
-                              onClick={() => {
-                                const url = URL.createObjectURL(
-                                  file.compressedBlob || file.file,
-                                );
-                                const a = document.createElement("a");
-                                a.href = url;
-                                a.download = `compressed_${file.file.name}`;
-                                a.click();
-                                URL.revokeObjectURL(url);
-                              }}
-                              className="p-2 sm:p-2.5 text-primary hover:bg-primary/10 rounded-full transition-colors"
-                              title="Download"
-                            >
-                              <Download className="w-5 h-5" />
-                            </button>
-                          )}
-                          <button
-                            onClick={() => removeFile(file.id)}
-                            className="p-2 sm:p-2.5 text-text-muted hover:text-red-500 hover:bg-red-500/10 rounded-full transition-colors"
-                          >
-                            <X className="w-5 h-5" />
-                          </button>
-                        </div>
-                      </motion.div>
+                        file={file}
+                        onRemove={removeFile}
+                        onDownload={downloadFile}
+                      />
                     ))}
                   </AnimatePresence>
                 </div>
