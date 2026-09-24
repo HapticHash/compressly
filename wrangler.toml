@@ -1,6 +1,14 @@
 name = "compressly"
+main = "worker/index.ts"
 compatibility_date = "2026-03-08"
-pages_build_output_dir = "dist"
+
+# Serve the Vite build as static assets; _headers in dist applies to them.
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+# API routes must hit the Worker instead of the SPA fallback.
+run_worker_first = ["/api/*"]
 
 [[kv_namespaces]]
 binding = "COMPRESSLY_STATS"
