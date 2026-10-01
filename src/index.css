@@ -1,18 +1,49 @@
 @import "tailwindcss";
 
+/* Dark mode follows the toggle (data-theme on <html>) or, when it's set to
+   "system", the OS preference. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
 @theme {
-  --font-display: "Nunito Sans", sans-serif;
-  --font-sans: "Nunito Sans", ui-sans-serif, system-ui, sans-serif;
-  
+  --font-display: "Nunito Sans Variable", sans-serif;
+  --font-sans: "Nunito Sans Variable", ui-sans-serif, system-ui, sans-serif;
+
   --color-bg: #fefae0;
   --color-surface: #ffffff;
   --color-surface-hover: #fefae0;
   --color-primary: #606c38;
+  --color-primary-hover: #4a532b;
+  --color-primary-dark: #283618;
   --color-accent: #bc6c25;
+  --color-accent-hover: #a65d1f;
+  --color-accent-dark: #8b4513;
   --color-accent-light: #dda15e;
+  --color-on-accent: #ffffff;
   --color-text: #283618;
   --color-text-muted: #394021;
   --color-border: #dda15e;
+  --color-danger: #c0392b;
+}
+
+@layer base {
+  :root[data-theme="dark"] {
+    --color-bg: #1a1e10;
+    --color-surface: #252a19;
+    --color-surface-hover: #2e3420;
+    --color-primary: #a7b56d;
+    --color-primary-hover: #bac682;
+    --color-primary-dark: #e3ebbd;
+    --color-accent: #dda15e;
+    --color-accent-hover: #e7b47a;
+    --color-accent-dark: #f0c590;
+    --color-accent-light: #c98a4a;
+    --color-on-accent: #1a1e10;
+    --color-text: #f2eed6;
+    --color-text-muted: #cbc6a8;
+    --color-border: #6b5636;
+    --color-danger: #ff8a7a;
+    color-scheme: dark;
+  }
 }
 
 body {

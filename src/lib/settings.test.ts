@@ -8,21 +8,31 @@ import {
   getVideoBitrateForTarget,
   getVideoCrf,
   isSettingsValid,
-  parseTargetMB,
+  getScaleFilter,
+  parseTarget,
 } from "./settings";
 
 const MB = 1024 * 1024;
 
-describe("parseTargetMB", () => {
-  it("converts megabytes to bytes", () => {
-    expect(parseTargetMB("2")).toBe(2 * MB);
-    expect(parseTargetMB("0.5")).toBe(0.5 * MB);
+describe("parseTarget", () => {
+  it("converts megabytes and kilobytes to bytes", () => {
+    expect(parseTarget("2")).toBe(2 * MB);
+    expect(parseTarget("0.5", "MB")).toBe(0.5 * MB);
+    expect(parseTarget("200", "KB")).toBe(200 * 1024);
   });
 
   it("rejects empty, zero, negative and non-numeric input", () => {
     for (const value of ["", "0", "-3", "abc"]) {
-      expect(parseTargetMB(value)).toBeNull();
+      expect(parseTarget(value)).toBeNull();
     }
+  });
+});
+
+describe("getScaleFilter", () => {
+  it("caps the short side for landscape and portrait", () => {
+    expect(getScaleFilter(720)).toBe(
+      "scale='if(gt(iw,ih),-2,min(720,iw))':'if(gt(iw,ih),min(720,ih),-2)'",
+    );
   });
 });
 
@@ -83,6 +93,8 @@ describe("getOutputName", () => {
   it("fixes the extension when the format changed", () => {
     expect(getOutputName("clip.mov", "video/mp4")).toBe("compressed_clip.mp4");
     expect(getOutputName("song.wav", "audio/mpeg")).toBe("compressed_song.mp3");
+    expect(getOutputName("photo.heic", "image/jpeg")).toBe("compressed_photo.jpg");
+    expect(getOutputName("photo.png", "image/avif")).toBe("compressed_photo.avif");
   });
 
   it("keeps the name when the format is unchanged", () => {

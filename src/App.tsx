@@ -1,33 +1,35 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import {
-  UploadCloud,
-  Settings,
-  X,
-  Download,
-  ArrowRight,
-  Activity,
-  HardDrive,
-} from "lucide-react";
+import { UploadCloud, X, Download, ArrowRight, Activity, HardDrive } from "lucide-react";
+import { BatchSummary, type Summary } from "./components/BatchSummary";
+import { CompareModal } from "./components/CompareModal";
 import { FileRow, type FileItem } from "./components/FileRow";
 import { FloatingBadges } from "./components/FloatingBadges";
+import { PrivacyBadge } from "./components/PrivacyBadge";
+import { SettingsPanel } from "./components/SettingsPanel";
+import { ThemeToggle } from "./components/ThemeToggle";
+import { useSettings } from "./hooks/useSettings";
+import { isAbortError } from "./lib/abort";
 import {
+  ACCEPTED_TYPES,
+  canPreviewOriginal,
   compressFile,
   createZip,
   downloadBlob,
+  filesFromDataTransfer,
   getFileKind,
 } from "./lib/compress";
+import { getLandingPage } from "./lib/landing";
 import {
-  type CompressionLevel,
-  type CompressionSettings,
-  LEVELS,
+  type FileOverrides,
+  applyOverrides,
   dedupeNames,
   estimateSavings,
   formatSize,
   getOutputName,
   isSettingsValid,
-  parseTargetMB,
 } from "./lib/settings";
+import { takeSharedFiles } from "./lib/share-target";
 
 /** Files compressed in parallel. FFmpeg jobs are still serialized internally. */
 const CONCURRENCY = 3;
@@ -60,12 +62,17 @@ async function runPool<T>(
   );
 }
 
+function outputFile(item: FileItem): File {
+  const blob = item.compressedBlob || item.file;
+  return new File([blob], getOutputName(item.file.name, blob.type), { type: blob.type });
+}
+
+const landing = getLandingPage(location.pathname);
+
 export default function App() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [isDragging, setIsDragging] = useState(false);
-  const [compressionLevel, setCompressionLevel] =
-    useState<CompressionLevel>("Medium");
-  const [targetSize, setTargetSize] = useState<string>("");
+  const { stored, settings, update } = useSettings(landing?.preset);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Mirrors `files` so async handlers always see the latest list.
@@ -76,12 +83,29 @@ export default function App() {
   const [totalFilesCompressed, setTotalFilesCompressed] = useState(0);
   const [totalDataSaved, setTotalDataSaved] = useState(0); // in bytes
   const [isSystemActive, setIsSystemActive] = useState(true);
+  const [processedBytes, setProcessedBytes] = useState(0);
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [compare, setCompare] = useState<{
+    id: string;
+    originalUrl: string | null;
+    compressedUrl: string;
+  } | null>(null);
 
-  const settings: CompressionSettings = useMemo(
-    () => ({ level: compressionLevel, targetBytes: parseTargetMB(targetSize) }),
-    [compressionLevel, targetSize],
-  );
   const settingsValid = isSettingsValid(settings);
+  const isCompressing = files.some((f) => f.status === "compressing");
+  const [canShareFiles] = useState(() => {
+    try {
+      return (
+        typeof navigator.canShare === "function" &&
+        navigator.canShare({ files: [new File([""], "test.txt", { type: "text/plain" })] })
+      );
+    } catch {
+      return false;
+    }
+  });
+
+  // One AbortController per file being compressed, for the cancel buttons.
+  const controllers = useRef(new Map<string, AbortController>());
 
   // Progress events arrive many times per second; batch them into one
   // state update per animation frame.
@@ -152,53 +176,101 @@ export default function App() {
     [],
   );
 
+  // Closing the tab mid-compression would silently lose the work.
+  useEffect(() => {
+    if (!isCompressing) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [isCompressing]);
+
   const addFiles = useCallback((newFiles: File[]) => {
+    if (newFiles.length === 0) return;
     const newItems: FileItem[] = newFiles.map((f) => {
       const kind = getFileKind(f);
       return {
         id: createId(),
         file: f,
+        kind,
         status: kind ? "idle" : "unsupported",
         progress: 0,
         originalSize: f.size,
         previewUrl:
-          kind === "image" || kind === "svg" || f.type.startsWith("video/")
+          canPreviewOriginal(f) || f.type.startsWith("video/")
             ? URL.createObjectURL(f)
             : undefined,
       };
     });
     setFiles((prev) => [...prev, ...newItems]);
+    setSummary(null);
 
     // Start downloading FFmpeg as soon as it's needed, not on page load.
-    if (newItems.some((item) => getFileKind(item.file) === "media")) {
+    if (newItems.some((item) => item.kind === "media")) {
       import("./lib/media")
         .then((m) => m.loadFFmpeg())
         .catch((e) => console.error("Failed to load FFmpeg", e));
     }
 
-    const pdfs = newItems.filter((item) => getFileKind(item.file) === "pdf");
+    const setPreview = (id: string, url: string) => {
+      // The file may have been removed while the preview rendered.
+      if (!filesRef.current.some((f) => f.id === id)) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+      setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, previewUrl: url } : f)));
+    };
+
+    const pdfs = newItems.filter((item) => item.kind === "pdf");
     if (pdfs.length > 0) {
       import("./lib/pdf").then(({ generatePdfThumbnail }) =>
         pdfs.forEach(async (item) => {
           try {
-            const thumbUrl = await generatePdfThumbnail(item.file);
-            // The file may have been removed while the thumbnail rendered.
-            if (!filesRef.current.some((f) => f.id === item.id)) {
-              URL.revokeObjectURL(thumbUrl);
-              return;
-            }
-            setFiles((prev) =>
-              prev.map((f) =>
-                f.id === item.id ? { ...f, previewUrl: thumbUrl } : f,
-              ),
-            );
+            setPreview(item.id, await generatePdfThumbnail(item.file));
           } catch (error) {
             console.error("Error generating PDF thumbnail:", error);
           }
         }),
       );
     }
+
+    // Browsers other than Safari can't show HEIC, so convert a small preview.
+    const heics = newItems.filter((item) => item.kind === "image" && !canPreviewOriginal(item.file));
+    if (heics.length > 0) {
+      import("./lib/image").then(({ heicToJpeg }) =>
+        heics.forEach(async (item) => {
+          try {
+            const jpeg = await heicToJpeg(item.file, 0.6);
+            setPreview(item.id, URL.createObjectURL(jpeg));
+          } catch (error) {
+            console.error("Error generating HEIC preview:", error);
+          }
+        }),
+      );
+    }
   }, []);
+
+  // Files shared to the installed app from another app (Android share sheet).
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (!params.has("shared")) return;
+    history.replaceState(null, "", location.pathname);
+    takeSharedFiles().then(addFiles).catch(console.error);
+  }, [addFiles]);
+
+  // Paste files or screenshots with Ctrl+V / Cmd+V.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const pasted = Array.from(e.clipboardData?.files ?? []);
+      if (pasted.length === 0) return;
+      e.preventDefault();
+      addFiles(pasted);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [addFiles]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -216,9 +288,8 @@ export default function App() {
     (e: React.DragEvent) => {
       e.preventDefault();
       setIsDragging(false);
-      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-        addFiles(Array.from(e.dataTransfer.files));
-      }
+      // Must start synchronously: the DataTransfer is cleared after the event.
+      filesFromDataTransfer(e.dataTransfer).then(addFiles).catch(console.error);
     },
     [addFiles],
   );
@@ -234,7 +305,12 @@ export default function App() {
     [addFiles],
   );
 
+  const cancelFile = useCallback((id: string) => {
+    controllers.current.get(id)?.abort();
+  }, []);
+
   const removeFile = useCallback((id: string) => {
+    controllers.current.get(id)?.abort();
     setFiles((prev) => {
       const fileToRemove = prev.find((f) => f.id === id);
       if (fileToRemove?.previewUrl) {
@@ -247,8 +323,48 @@ export default function App() {
   const downloadFile = useCallback((id: string) => {
     const item = filesRef.current.find((f) => f.id === id);
     if (!item) return;
-    const blob = item.compressedBlob || item.file;
-    downloadBlob(blob, getOutputName(item.file.name, blob.type));
+    const file = outputFile(item);
+    downloadBlob(file, file.name);
+  }, []);
+
+  const shareFile = useCallback((id: string) => {
+    const item = filesRef.current.find((f) => f.id === id);
+    if (!item) return;
+    navigator.share({ files: [outputFile(item)] }).catch((error) => {
+      // AbortError just means the user closed the share sheet.
+      if (error?.name !== "AbortError") console.error("Share failed", error);
+    });
+  }, []);
+
+  const setOverrides = useCallback((id: string, overrides: FileOverrides) => {
+    setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, overrides } : f)));
+  }, []);
+
+  const openCompare = useCallback(async (id: string) => {
+    const item = filesRef.current.find((f) => f.id === id);
+    if (!item?.compressedBlob) return;
+    let originalUrl: string | null = null;
+    if (canPreviewOriginal(item.file)) {
+      originalUrl = URL.createObjectURL(item.file);
+    } else {
+      try {
+        const { heicToJpeg } = await import("./lib/image");
+        originalUrl = URL.createObjectURL(await heicToJpeg(item.file, 0.95));
+      } catch {
+        originalUrl = null;
+      }
+    }
+    setCompare({ id, originalUrl, compressedUrl: URL.createObjectURL(item.compressedBlob) });
+  }, []);
+
+  const closeCompare = useCallback(() => {
+    setCompare((current) => {
+      if (current) {
+        if (current.originalUrl) URL.revokeObjectURL(current.originalUrl);
+        URL.revokeObjectURL(current.compressedUrl);
+      }
+      return null;
+    });
   }, []);
 
   const handleCompression = async (scope: CompressionScope = "all") => {
@@ -257,6 +373,7 @@ export default function App() {
     if (selected.length === 0) return;
 
     const ids = new Set(selected.map((f) => f.id));
+    setSummary(null);
     setFiles((prev) =>
       prev.map((f) =>
         ids.has(f.id)
@@ -267,22 +384,32 @@ export default function App() {
               compressedSize: undefined,
               compressedBlob: undefined,
               keptOriginal: false,
+              metadataRemoved: false,
             }
           : f,
       ),
     );
 
+    const startedAt = performance.now();
     let filesCount = 0;
     let bytesSaved = 0;
+    let processed = 0;
+    let originalBytes = 0;
+    let failed = 0;
 
     await runPool(selected, CONCURRENCY, async (fileItem: FileItem) => {
+      const controller = new AbortController();
+      controllers.current.set(fileItem.id, controller);
       try {
-        const { blob, keptOriginal } = await compressFile(
+        const { blob, keptOriginal, metadataRemoved } = await compressFile(
           fileItem.file,
           fileItem.id,
-          settings,
+          applyOverrides(settings, fileItem.overrides),
+          fileItem.overrides,
           (progress) => setProgress(fileItem.id, progress),
+          controller.signal,
         );
+        if (controller.signal.aborted) throw new DOMException("", "AbortError");
         pendingProgress.current.delete(fileItem.id);
         setFiles((prev) =>
           prev.map((f) =>
@@ -294,24 +421,46 @@ export default function App() {
                   compressedSize: blob.size,
                   compressedBlob: blob,
                   keptOriginal,
+                  metadataRemoved,
                 }
               : f,
           ),
         );
+        processed += 1;
+        originalBytes += fileItem.originalSize;
         if (!keptOriginal) {
           filesCount += 1;
-          bytesSaved += fileItem.originalSize - blob.size;
+          bytesSaved += Math.max(0, fileItem.originalSize - blob.size);
         }
       } catch (error) {
-        console.error("Compression error:", error);
         pendingProgress.current.delete(fileItem.id);
+        const cancelled = isAbortError(error) || controller.signal.aborted;
+        if (!cancelled) {
+          console.error("Compression error:", error);
+          failed += 1;
+        }
         setFiles((prev) =>
           prev.map((f) =>
-            f.id === fileItem.id ? { ...f, status: "error" } : f,
+            f.id === fileItem.id
+              ? { ...f, status: cancelled ? "idle" : "error", progress: 0 }
+              : f,
           ),
         );
+      } finally {
+        controllers.current.delete(fileItem.id);
       }
     });
+
+    setProcessedBytes((prev) => prev + originalBytes);
+    if (processed + failed > 0) {
+      setSummary({
+        files: processed,
+        failed,
+        originalBytes,
+        savedBytes: bytesSaved,
+        seconds: (performance.now() - startedAt) / 1000,
+      });
+    }
 
     if (filesCount > 0) {
       setTotalFilesCompressed((prev) => prev + filesCount);
@@ -329,19 +478,17 @@ export default function App() {
     const doneFiles = files.filter((f) => f.status === "done");
     if (doneFiles.length === 0) return;
 
-    const blobs = doneFiles.map((f) => f.compressedBlob || f.file);
-    const names = dedupeNames(
-      doneFiles.map((f, i) => getOutputName(f.file.name, blobs[i].type)),
-    );
-    const zip = await createZip(
-      names.map((name, i) => ({ name, blob: blobs[i] })),
-    );
+    const outputs = doneFiles.map(outputFile);
+    const names = dedupeNames(outputs.map((f) => f.name));
+    const zip = await createZip(names.map((name, i) => ({ name, blob: outputs[i] })));
     downloadBlob(zip, `compressly_${Date.now()}.zip`);
   };
 
   const clearQueue = () => {
+    controllers.current.forEach((controller) => controller.abort());
     files.forEach((f) => f.previewUrl && URL.revokeObjectURL(f.previewUrl));
     setFiles([]);
+    setSummary(null);
   };
 
   const compressible = files.filter((f) => f.status !== "unsupported");
@@ -350,22 +497,71 @@ export default function App() {
     compressible.every((f) => f.status === "compressing") ||
     !settingsValid;
 
+  const kinds = useMemo(
+    () => ({
+      image: files.some((f) => f.kind === "image" || f.kind === "gif"),
+      pdf: files.some((f) => f.kind === "pdf"),
+      video: files.some((f) => f.kind === "media" && f.file.type.startsWith("video/")),
+    }),
+    [files],
+  );
+
   const estimate = useMemo(
     () =>
       estimateSavings(
-        files
-          .filter((f) => isInScope(f, "all"))
-          .map((f) => f.originalSize),
+        files.filter((f) => isInScope(f, "all")).map((f) => f.originalSize),
         settings,
       ),
     [files, settings],
   );
 
+  const compareItem = compare && files.find((f) => f.id === compare.id);
+
+  const handleTitleClick = () => {
+    if (landing) location.href = "/";
+    else window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const actionButtons =
+    files.some((f) => f.status === "idle") && files.some((f) => f.status === "done") ? (
+      <div className="flex flex-col gap-3 w-full sm:w-auto items-center">
+        <button
+          onClick={() => handleCompression("new")}
+          disabled={isBusy}
+          className="w-full sm:w-auto h-12 px-8 rounded-full bg-primary text-on-accent hover:bg-primary-hover hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap"
+        >
+          Compress New <ArrowRight className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => handleCompression("old")}
+          disabled={isBusy}
+          className="w-full sm:w-auto h-12 px-8 rounded-full bg-accent text-on-accent hover:bg-accent-hover hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap"
+        >
+          Re-compress Old <ArrowRight className="w-4 h-4" />
+        </button>
+      </div>
+    ) : (
+      <button
+        onClick={() => handleCompression("all")}
+        disabled={isBusy}
+        className="w-full sm:w-auto h-12 px-8 rounded-full bg-primary text-on-accent hover:bg-primary-hover hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium"
+      >
+        {compressible.length > 0 && compressible.every((f) => f.status === "done")
+          ? "Re-compress All"
+          : compressible.length === 1
+            ? "Compress"
+            : "Compress All"}{" "}
+        <ArrowRight className="w-4 h-4" />
+      </button>
+    );
+
   return (
     <div className="min-h-screen flex flex-col items-center py-16 px-4 sm:px-6 lg:px-8 relative overflow-hidden selection:bg-primary/30">
       {/* Decorative Background Elements (gradients instead of costly blur filters) */}
-      <div className="absolute top-[-20%] left-[-10%] w-[60vw] h-[60vw] rounded-full bg-[radial-gradient(circle,rgb(96_108_56/0.12)_0%,transparent_70%)] pointer-events-none" />
-      <div className="absolute bottom-[-20%] right-[-10%] w-[60vw] h-[60vw] rounded-full bg-[radial-gradient(circle,rgb(188_108_37/0.12)_0%,transparent_70%)] pointer-events-none" />
+      <div className="absolute top-[-20%] left-[-10%] w-[60vw] h-[60vw] rounded-full bg-[radial-gradient(circle,color-mix(in_srgb,var(--color-primary)_12%,transparent)_0%,transparent_70%)] pointer-events-none" />
+      <div className="absolute bottom-[-20%] right-[-10%] w-[60vw] h-[60vw] rounded-full bg-[radial-gradient(circle,color-mix(in_srgb,var(--color-accent)_12%,transparent)_0%,transparent_70%)] pointer-events-none" />
+
+      <ThemeToggle />
 
       {/* Subtle Decorative Icons */}
       <FloatingBadges />
@@ -376,10 +572,23 @@ export default function App() {
           <motion.h1
             initial={{ opacity: 0, y: -20 }}
             animate={{ opacity: 1, y: 0 }}
-            onClick={() => window.location.reload()}
-            className="text-6xl md:text-7xl font-display font-bold text-primary-dark mb-6 tracking-tight cursor-pointer hover:opacity-80 transition-opacity"
+            className={`${landing ? "text-4xl md:text-5xl" : "text-6xl md:text-7xl"} font-display font-bold text-primary-dark mb-6 tracking-tight`}
           >
-            Compressly
+            {landing ? (
+              <>
+                <button
+                  onClick={handleTitleClick}
+                  className="block mx-auto mb-3 text-lg font-semibold text-primary hover:opacity-80 transition-opacity"
+                >
+                  Compressly
+                </button>
+                {landing.heading}
+              </>
+            ) : (
+              <button onClick={handleTitleClick} className="hover:opacity-80 transition-opacity">
+                Compressly
+              </button>
+            )}
           </motion.h1>
           <motion.p
             initial={{ opacity: 0, y: -10 }}
@@ -387,8 +596,9 @@ export default function App() {
             transition={{ delay: 0.1 }}
             className="text-lg md:text-xl text-text-muted max-w-2xl mx-auto font-light leading-relaxed"
           >
-            Shrink your files, keep the magic. Premium compression for creators
-            who care about quality.
+            {landing
+              ? landing.intro
+              : "Shrink your files, keep the magic. Premium compression for creators who care about quality."}
           </motion.p>
         </header>
 
@@ -399,7 +609,7 @@ export default function App() {
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ delay: 0.2 }}
-            className={`relative border-2 border-dashed rounded-[2rem] p-12 flex flex-col items-center justify-center text-center transition-all duration-300 bg-surface/30 backdrop-blur-xl shadow-2xl
+            className={`relative border-2 border-dashed rounded-[2rem] p-8 sm:p-12 flex flex-col items-center justify-center text-center transition-all duration-300 bg-surface/30 backdrop-blur-xl shadow-2xl
               ${isDragging ? "border-primary bg-primary/5 scale-[1.02]" : "border-border hover:border-primary/50 hover:bg-surface/50"}`}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -411,27 +621,29 @@ export default function App() {
               className="hidden"
               ref={fileInputRef}
               onChange={handleFileInput}
-              accept="image/jpeg,image/png,image/webp,image/bmp,image/svg+xml,video/*,audio/*,application/pdf"
+              accept={ACCEPTED_TYPES}
             />
             <div className="w-24 h-24 rounded-full bg-surface border border-border flex items-center justify-center mb-6 shadow-lg shadow-black/5">
-              <UploadCloud
-                className="w-10 h-10 text-primary"
-                strokeWidth={1.5}
-              />
+              <UploadCloud className="w-10 h-10 text-primary" strokeWidth={1.5} />
             </div>
             <h3 className="text-3xl font-display font-semibold text-text mb-3">
               Drop your files here
             </h3>
-            <p className="text-text-muted mb-8 text-lg">
-              Supports PDF, JPG, PNG, WebP, SVG, MP4, MP3 and more
+            <p className="text-text-muted mb-2 text-lg">
+              PDF, JPG, PNG, HEIC, WebP, GIF, SVG, MP4, MP3 and more
+            </p>
+            <p className="text-text-muted mb-8 text-sm">
+              Drop whole folders, or paste with Ctrl+V
             </p>
             <button
               onClick={() => fileInputRef.current?.click()}
-              className="px-10 py-4 rounded-full bg-primary text-surface hover:bg-[#4a532b] hover:shadow-lg transition-all duration-300 font-medium tracking-wide text-sm"
+              className="px-10 py-4 rounded-full bg-primary text-on-accent hover:bg-primary-hover hover:shadow-lg transition-all duration-300 font-medium tracking-wide text-sm"
             >
               Select Files
             </button>
           </motion.div>
+
+          <PrivacyBadge processedBytes={processedBytes} />
 
           {/* Settings & File List */}
           <AnimatePresence>
@@ -442,138 +654,16 @@ export default function App() {
                 exit={{ opacity: 0, height: 0 }}
                 className="flex flex-col gap-6"
               >
-                {/* Settings Panel */}
-                <div className="bg-surface/40 backdrop-blur-xl rounded-3xl p-8 border border-border shadow-xl">
-                  <div className="flex items-center gap-3 mb-6">
-                    <Settings className="w-5 h-5 text-primary" />
-                    <h4 className="text-xl font-display font-medium text-text">
-                      Compression Settings
-                    </h4>
-                  </div>
+                <SettingsPanel
+                  stored={stored}
+                  update={update}
+                  targetValid={settingsValid}
+                  estimate={estimate}
+                  kinds={kinds}
+                  actions={actionButtons}
+                />
 
-                  <div className="flex flex-col gap-6">
-                    <div className="w-full flex flex-col gap-4">
-                      <div>
-                        <label className="block text-xs uppercase tracking-widest text-text-muted mb-3 font-semibold">
-                          Level
-                        </label>
-                        <div
-                          role="group"
-                          aria-label="Compression level"
-                          className="flex flex-wrap sm:flex-nowrap bg-bg rounded-2xl p-1 border border-border min-h-[3rem]"
-                        >
-                          {LEVELS.map((level) => (
-                            <button
-                              key={level}
-                              onClick={() => setCompressionLevel(level)}
-                              aria-pressed={compressionLevel === level}
-                              className={`flex-1 min-w-[30%] sm:min-w-0 h-10 sm:h-auto flex items-center justify-center px-2 sm:px-3 text-xs sm:text-sm rounded-xl transition-all duration-200 ${
-                                compressionLevel === level
-                                  ? "bg-accent text-surface shadow-md font-medium"
-                                  : "text-text-muted hover:text-accent hover:bg-accent/10"
-                              }`}
-                            >
-                              {level}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-
-                      <AnimatePresence>
-                        {compressionLevel === "Custom" && (
-                          <motion.div
-                            initial={{ opacity: 0, height: 0 }}
-                            animate={{ opacity: 1, height: "auto" }}
-                            exit={{ opacity: 0, height: 0 }}
-                            className="w-full overflow-hidden"
-                          >
-                            <label
-                              htmlFor="target-size"
-                              className="block text-xs uppercase tracking-widest text-text-muted mb-3 font-semibold"
-                            >
-                              Target per file (MB)
-                            </label>
-                            <input
-                              id="target-size"
-                              type="number"
-                              min="0"
-                              step="any"
-                              value={targetSize}
-                              onChange={(e) => setTargetSize(e.target.value)}
-                              placeholder="e.g. 5"
-                              aria-invalid={!settingsValid}
-                              aria-describedby="target-size-hint"
-                              className="w-full h-12 bg-bg border border-border rounded-2xl px-4 text-sm focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all text-text"
-                            />
-                            {!settingsValid && (
-                              <p
-                                id="target-size-hint"
-                                className="mt-2 text-xs text-accent"
-                              >
-                                Enter a target size greater than 0.
-                              </p>
-                            )}
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
-                    </div>
-
-                    {estimate && (
-                      <motion.div
-                        initial={{ opacity: 0, y: -5 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="w-full text-sm text-text-muted flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2 bg-primary/5 p-3.5 rounded-xl border border-primary/10"
-                      >
-                        <div className="flex items-center gap-2">
-                          <Activity className="w-4 h-4 text-primary shrink-0" />
-                          <span>Estimated savings:</span>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <span className="font-semibold text-primary-dark">
-                            {formatSize(estimate.saved)}
-                          </span>
-                          <span>({estimate.percentage}%)</span>
-                        </div>
-                      </motion.div>
-                    )}
-
-                    <div className="w-full flex justify-center sm:justify-end">
-                      {files.some((f) => f.status === "idle") &&
-                      files.some((f) => f.status === "done") ? (
-                        <div className="flex flex-col gap-3 w-full sm:w-auto items-center">
-                          <button
-                            onClick={() => handleCompression("new")}
-                            disabled={isBusy}
-                            className="w-full sm:w-auto h-12 px-8 rounded-full bg-primary text-surface hover:bg-[#4a532b] hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap"
-                          >
-                            Compress New <ArrowRight className="w-4 h-4" />
-                          </button>
-                          <button
-                            onClick={() => handleCompression("old")}
-                            disabled={isBusy}
-                            className="w-full sm:w-auto h-12 px-8 rounded-full bg-accent text-surface hover:bg-[#a65d1f] hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap"
-                          >
-                            Re-compress Old <ArrowRight className="w-4 h-4" />
-                          </button>
-                        </div>
-                      ) : (
-                        <button
-                          onClick={() => handleCompression("all")}
-                          disabled={isBusy}
-                          className="w-full sm:w-auto h-12 px-8 rounded-full bg-primary text-surface hover:bg-[#4a532b] hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium"
-                        >
-                          {compressible.length > 0 &&
-                          compressible.every((f) => f.status === "done")
-                            ? "Re-compress All"
-                            : compressible.length === 1
-                              ? "Compress"
-                              : "Compress All"}{" "}
-                          <ArrowRight className="w-4 h-4" />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                </div>
+                {summary && <BatchSummary summary={summary} onClose={() => setSummary(null)} />}
 
                 {/* File List */}
                 <div className="flex flex-col gap-3">
@@ -585,14 +675,14 @@ export default function App() {
                       {files.some((f) => f.status === "done") && (
                         <button
                           onClick={handleDownloadAll}
-                          className="text-sm font-medium text-accent hover:text-[#8b4513] flex items-center gap-1.5 transition-colors"
+                          className="text-sm font-medium text-accent hover:text-accent-dark flex items-center gap-1.5 transition-colors"
                         >
                           <Download className="w-4 h-4" /> Download All
                         </button>
                       )}
                       <button
                         onClick={clearQueue}
-                        className="text-sm font-medium text-text-muted hover:text-red-500 flex items-center gap-1.5 transition-colors"
+                        className="text-sm font-medium text-text-muted hover:text-danger flex items-center gap-1.5 transition-colors"
                       >
                         <X className="w-4 h-4" /> Clear Queue
                       </button>
@@ -603,8 +693,13 @@ export default function App() {
                       <FileRow
                         key={file.id}
                         file={file}
+                        canShare={canShareFiles}
                         onRemove={removeFile}
+                        onCancel={cancelFile}
                         onDownload={downloadFile}
+                        onShare={shareFile}
+                        onCompare={openCompare}
+                        onOverrides={setOverrides}
                       />
                     ))}
                   </AnimatePresence>
@@ -614,6 +709,17 @@ export default function App() {
           </AnimatePresence>
         </main>
       </div>
+
+      {compare && compareItem && (
+        <CompareModal
+          name={compareItem.file.name}
+          originalUrl={compare.originalUrl}
+          compressedUrl={compare.compressedUrl}
+          originalSize={compareItem.originalSize}
+          compressedSize={compareItem.compressedSize ?? compareItem.originalSize}
+          onClose={closeCompare}
+        />
+      )}
 
       {/* How it Works Section */}
       <section className="w-full max-w-5xl mt-32 mb-12 z-10">
@@ -625,7 +731,7 @@ export default function App() {
           <div className="hidden md:block absolute top-10 left-[16%] right-[16%] h-[2px] bg-primary/20 -z-10" />
 
           <div className="flex flex-col items-center text-center">
-            <div className="w-20 h-20 rounded-full bg-accent text-surface flex items-center justify-center mb-6 text-2xl font-display font-bold shadow-lg shadow-black/5">
+            <div className="w-20 h-20 rounded-full bg-accent text-on-accent flex items-center justify-center mb-6 text-2xl font-display font-bold shadow-lg shadow-black/5">
               1
             </div>
             <h3 className="text-2xl font-display font-semibold text-text mb-3">
@@ -637,7 +743,7 @@ export default function App() {
             </p>
           </div>
           <div className="flex flex-col items-center text-center">
-            <div className="w-20 h-20 rounded-full bg-accent text-surface flex items-center justify-center mb-6 text-2xl font-display font-bold shadow-lg shadow-black/5">
+            <div className="w-20 h-20 rounded-full bg-accent text-on-accent flex items-center justify-center mb-6 text-2xl font-display font-bold shadow-lg shadow-black/5">
               2
             </div>
             <h3 className="text-2xl font-display font-semibold text-text mb-3">
@@ -649,7 +755,7 @@ export default function App() {
             </p>
           </div>
           <div className="flex flex-col items-center text-center">
-            <div className="w-20 h-20 rounded-full bg-accent text-surface flex items-center justify-center mb-6 text-2xl font-display font-bold shadow-lg shadow-black/5">
+            <div className="w-20 h-20 rounded-full bg-accent text-on-accent flex items-center justify-center mb-6 text-2xl font-display font-bold shadow-lg shadow-black/5">
               3
             </div>
             <h3 className="text-2xl font-display font-semibold text-text mb-3">
@@ -715,14 +821,14 @@ export default function App() {
           <div className="flex items-center gap-2 bg-surface/50 px-3 py-1.5 rounded-full border border-border shadow-sm">
             <span className="relative flex h-2 w-2">
               <span
-                className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${isSystemActive ? "bg-primary" : "bg-red-500"}`}
+                className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${isSystemActive ? "bg-primary" : "bg-danger"}`}
               ></span>
               <span
-                className={`relative inline-flex rounded-full h-2 w-2 ${isSystemActive ? "bg-primary" : "bg-red-500"}`}
+                className={`relative inline-flex rounded-full h-2 w-2 ${isSystemActive ? "bg-primary" : "bg-danger"}`}
               ></span>
             </span>
             <span
-              className={`font-medium text-xs uppercase tracking-wider ${isSystemActive ? "text-primary-dark" : "text-red-600"}`}
+              className={`font-medium text-xs uppercase tracking-wider ${isSystemActive ? "text-primary-dark" : "text-danger"}`}
             >
               {isSystemActive ? "Systems Active" : "Systems Offline"}
             </span>

@@ -16,6 +16,12 @@ export default {
       return new Response(null, { status: 405, headers: { Allow: 'GET, POST' } });
     }
 
+    // Normally handled by the service worker; this only runs if it isn't
+    // installed yet, so send the user to the app instead of an error.
+    if (pathname === '/share-target') {
+      return Response.redirect(new URL('/', request.url).toString(), 303);
+    }
+
     if (pathname.startsWith('/api/')) {
       return Response.json({ error: 'Not found' }, { status: 404 });
     }

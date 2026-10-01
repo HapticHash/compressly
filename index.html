@@ -3,40 +3,50 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <!-- Basic SEO -->
-    <title>Compressly – Premium File Compression for Creators</title>
-    <meta name="title" content="Compressly – Premium File Compression">
-    <meta name="description" content="Shrink your files, keep the magic. Compressly delivers premium file compression for creators who care about quality. Optimize images, videos, and assets without losing detail.">
-    <meta name="keywords" content="Compressly, file compression, image compression, video compression, lossless compression, creator tools, optimize media, reduce file size">
+    <!-- Page-specific values are filled in by the landing-pages plugin in vite.config.ts -->
+    <title>__PAGE_TITLE__</title>
+    <meta name="description" content="__PAGE_DESCRIPTION__">
     <meta name="author" content="Compressly">
     <meta name="robots" content="index, follow">
-    
+    <link rel="canonical" href="__PAGE_URL__">
+
     <!-- Open Graph / Facebook -->
     <meta property="og:type" content="website">
-    <meta property="og:title" content="Compressly – Shrink Your Files, Keep the Magic">
-    <meta property="og:description" content="Premium compression for creators who care about quality. Reduce file size while preserving the details that matter.">
+    <meta property="og:title" content="__PAGE_TITLE__">
+    <meta property="og:description" content="__PAGE_DESCRIPTION__">
     <meta property="og:site_name" content="Compressly">
-    <meta property="og:url" content="https://compressly.harshitks2203.workers.dev/">
-    
+    <meta property="og:url" content="__PAGE_URL__">
+    <meta property="og:image" content="__SITE_URL__/og-image.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+
     <!-- Twitter / X -->
     <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="Compressly – Shrink Your Files, Keep the Magic">
-    <meta name="twitter:description" content="Premium compression for creators who care about quality.">
-    
+    <meta name="twitter:title" content="__PAGE_TITLE__">
+    <meta name="twitter:description" content="__PAGE_DESCRIPTION__">
+    <meta name="twitter:image" content="__SITE_URL__/og-image.png">
+
     <!-- App / Product -->
     <meta name="application-name" content="Compressly">
     <meta name="apple-mobile-web-app-title" content="Compressly">
     <meta name="theme-color" content="#fefae0">
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23606c38'/%3E%3Ctext x='16' y='23' font-family='sans-serif' font-size='20' font-weight='700' fill='%23fefae0' text-anchor='middle'%3EC%3C/text%3E%3C/svg%3E">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
 
-    <!-- Fonts: loaded here rather than via CSS @import so the request starts immediately -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" crossorigin href="https://fonts.googleapis.com/css2?family=Nunito+Sans:opsz,wght@6..12,300..700&display=swap">
+    <!-- Apply the saved theme before first paint to avoid a light flash in dark mode. -->
+    <script>
+      (function () {
+        var pref = "system";
+        try { pref = JSON.parse(localStorage.getItem("compressly:theme")) || "system"; } catch (e) {}
+        var dark = pref === "dark" || (pref === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+        if (dark) document.querySelector('meta[name="theme-color"]').setAttribute("content", "#1a1e10");
+      })();
+    </script>
   </head>
   <body>
-    <div id="root"></div>
+    <!-- Static content for search engines and no-JS visitors; React replaces it. -->
+    <div id="root">__PAGE_CONTENT__</div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

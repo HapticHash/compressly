@@ -3,61 +3,34 @@
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 // @ts-ignore
 import pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
-import { PDFDocument } from "pdf-lib";
-import {
-  type CompressionSettings,
-  getPdfRenderOptions,
-  getTargetRatio,
-} from "./settings";
+import { isAbortError, runWorkerJob } from "./abort";
+import { compressPdfBytes, pdfAssetOptions, type PdfSettings } from "./pdf-core";
+import type { CompressionSettings } from "./settings";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 const THUMBNAIL_WIDTH = 160;
 
-function canvasToBlob(
-  canvas: HTMLCanvasElement,
-  type: string,
-  quality?: number,
-): Promise<Blob> {
-  return new Promise((resolve, reject) =>
-    canvas.toBlob(
-      (blob) => (blob ? resolve(blob) : reject(new Error("Canvas export failed"))),
-      type,
-      quality,
-    ),
-  );
-}
-
-/** Frees the canvas backing store right away instead of waiting for GC. */
-function releaseCanvas(canvas: HTMLCanvasElement) {
-  canvas.width = 0;
-  canvas.height = 0;
-}
-
-async function renderPage(
-  page: pdfjsLib.PDFPageProxy,
-  scale: number,
-): Promise<HTMLCanvasElement> {
-  const viewport = page.getViewport({ scale });
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.floor(viewport.width));
-  canvas.height = Math.max(1, Math.floor(viewport.height));
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("Canvas 2D context unavailable");
-  await page.render({ canvasContext: context, viewport } as any).promise;
-  return canvas;
-}
-
 export async function generatePdfThumbnail(file: File): Promise<string> {
-  const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() })
-    .promise;
+  const pdf = await pdfjsLib.getDocument({
+    data: await file.arrayBuffer(),
+    ...pdfAssetOptions(location.origin),
+  }).promise;
   try {
     const page = await pdf.getPage(1);
     const scale = THUMBNAIL_WIDTH / page.getViewport({ scale: 1 }).width;
-    const canvas = await renderPage(page, scale);
-    const blob = await canvasToBlob(canvas, "image/jpeg", 0.8);
-    releaseCanvas(canvas);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.floor(viewport.width));
+    canvas.height = Math.max(1, Math.floor(viewport.height));
+    await page.render({ canvas, viewport } as any).promise;
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", 0.8),
+    );
+    canvas.width = 0;
+    canvas.height = 0;
     page.cleanup();
+    if (!blob) throw new Error("Canvas export failed");
     return URL.createObjectURL(blob);
   } finally {
     await pdf.destroy();
@@ -65,45 +38,35 @@ export async function generatePdfThumbnail(file: File): Promise<string> {
 }
 
 /**
- * Rasterizes each page to a JPEG and rebuilds the PDF from those images.
- * Text becomes non-selectable, so callers should keep the original when the
- * result isn't smaller.
+ * Compresses in a worker; falls back to the main thread if the browser can't
+ * run pdf.js there (e.g. no OffscreenCanvas or nested workers).
  */
 export async function compressPdf(
   file: File,
   settings: CompressionSettings,
   onProgress: (percent: number) => void,
+  signal?: AbortSignal,
 ): Promise<Blob> {
-  const { scale, quality } = getPdfRenderOptions(
-    settings.level,
-    getTargetRatio(settings, file.size),
-  );
-  const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() })
-    .promise;
+  const pdfSettings: PdfSettings = {
+    level: settings.level,
+    targetBytes: settings.targetBytes,
+    pdfMode: settings.pdfMode,
+  };
+  let bytes: Uint8Array;
   try {
-    const newPdf = await PDFDocument.create();
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
-      // Keep the page's physical size; only the embedded image resolution changes.
-      const pageSize = page.getViewport({ scale: 1 });
-      const canvas = await renderPage(page, scale);
-      const jpeg = await canvasToBlob(canvas, "image/jpeg", quality);
-      releaseCanvas(canvas);
-      page.cleanup();
-
-      const image = await newPdf.embedJpg(await jpeg.arrayBuffer());
-      const pdfPage = newPdf.addPage([pageSize.width, pageSize.height]);
-      pdfPage.drawImage(image, {
-        x: 0,
-        y: 0,
-        width: pageSize.width,
-        height: pageSize.height,
-      });
-      onProgress(Math.round((i / pdf.numPages) * 100));
-    }
-    const bytes = await newPdf.save();
-    return new Blob([bytes], { type: "application/pdf" });
-  } finally {
-    await pdf.destroy();
+    const worker = new Worker(new URL("./pdf.worker-job.ts", import.meta.url), {
+      type: "module",
+    });
+    bytes = await runWorkerJob<Uint8Array>(
+      worker,
+      { data: await file.arrayBuffer(), settings: pdfSettings },
+      onProgress,
+      signal,
+    );
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    console.warn("PDF worker failed, compressing on the main thread", error);
+    bytes = await compressPdfBytes(await file.arrayBuffer(), pdfSettings, onProgress, signal);
   }
+  return new Blob([bytes], { type: "application/pdf" });
 }
