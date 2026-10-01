@@ -1,12 +1,6 @@
-const STATS_KEY = 'stats';
 // Upper bounds for a single report; anything larger is rejected as bogus.
 const MAX_FILES_PER_REPORT = 1000;
 const MAX_BYTES_PER_REPORT = 100 * 1024 ** 3; // 100 GB
-
-interface Stats {
-  totalFilesCompressed: number;
-  totalDataSaved: number;
-}
 
 function json(data: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(data), {
@@ -15,28 +9,18 @@ function json(data: unknown, init: ResponseInit = {}) {
   });
 }
 
-function isValidCount(value: unknown, max: number): value is number {
+export function isValidCount(value: unknown, max: number): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= max;
 }
 
-// Both totals live in one key, so each update costs a single KV write.
-// Falls back to the legacy per-counter keys the first time it runs.
-async function readStats(kv: any): Promise<Stats> {
-  const stored = await kv.get(STATS_KEY, 'json');
-  if (stored) return stored;
-  const [files, saved] = await Promise.all([
-    kv.get('totalFilesCompressed'),
-    kv.get('totalDataSaved'),
-  ]);
-  return {
-    totalFilesCompressed: parseInt(files || '0', 10) || 0,
-    totalDataSaved: parseInt(saved || '0', 10) || 0,
-  };
+/** The single global counter instance. */
+function counter(env: any) {
+  return env.STATS_COUNTER.get(env.STATS_COUNTER.idFromName('global'));
 }
 
 export async function handleStatsGet(env: any) {
   try {
-    const stats = await readStats(env.COMPRESSLY_STATS);
+    const stats = await counter(env).getStats();
     return json(stats, {
       headers: {
         'Access-Control-Allow-Origin': '*',
@@ -48,8 +32,6 @@ export async function handleStatsGet(env: any) {
   }
 }
 
-// Note: KV has no atomic increment, so concurrent reports can still overwrite
-// each other. A Durable Object or D1 counter is needed for exact totals.
 export async function handleStatsPost(request: Request, env: any) {
   let body: any;
   try {
@@ -67,14 +49,7 @@ export async function handleStatsPost(request: Request, env: any) {
   }
 
   try {
-    const stats = await readStats(env.COMPRESSLY_STATS);
-    await env.COMPRESSLY_STATS.put(
-      STATS_KEY,
-      JSON.stringify({
-        totalFilesCompressed: stats.totalFilesCompressed + filesCount,
-        totalDataSaved: stats.totalDataSaved + bytesSaved,
-      }),
-    );
+    await counter(env).add(filesCount, bytesSaved);
     return json({ success: true });
   } catch (err: any) {
     return json({ error: err.message }, { status: 500 });

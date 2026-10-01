@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { readStorage, writeStorage } from "../lib/storage";
 import type { LandingPreset } from "../lib/landing";
 import {
@@ -48,7 +48,16 @@ function initialSettings(preset?: LandingPreset): StoredSettings {
 export function useSettings(preset?: LandingPreset) {
   const [stored, setStored] = useState<StoredSettings>(() => initialSettings(preset));
 
-  useEffect(() => writeStorage(STORAGE_KEY, stored), [stored]);
+  // Save only after the user changes something, so a landing page's preset
+  // doesn't overwrite the settings remembered from earlier visits.
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    writeStorage(STORAGE_KEY, stored);
+  }, [stored]);
 
   const settings: CompressionSettings = useMemo(
     () => ({
