@@ -1,4 +1,5 @@
 import { memo, useState } from "react";
+import { Select } from "./Select";
 import { motion } from "motion/react";
 import {
   Columns2,
@@ -6,6 +7,7 @@ import {
   File,
   FileText,
   Image as ImageIcon,
+  MapPin,
   MapPinOff,
   Music,
   Share2,
@@ -15,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import type { FileKind } from "../lib/compress";
+import type { MetadataOutcome } from "../lib/image";
 import { type FileOverrides, PRESET_LEVELS, formatSize } from "../lib/settings";
 
 export interface FileItem {
@@ -23,10 +26,12 @@ export interface FileItem {
   kind: FileKind | null;
   status: "idle" | "compressing" | "done" | "error" | "unsupported";
   progress: number;
+  /** Compressing, but still waiting for a free slot. */
+  waiting?: boolean;
   originalSize: number;
   compressedSize?: number;
   keptOriginal?: boolean;
-  metadataRemoved?: boolean;
+  metadata?: MetadataOutcome;
   previewUrl?: string;
   compressedBlob?: Blob;
   overrides?: FileOverrides;
@@ -136,10 +141,22 @@ export const FileRow = memo(function FileRow({
                 </span>
               </div>
             )}
-            {file.status === "done" && file.metadataRemoved && (
+            {file.status === "done" && file.metadata === "removed" && (
               <span className="flex items-center gap-1 text-xs">
                 <MapPinOff className="w-3.5 h-3.5" aria-hidden="true" />
                 Location &amp; camera data removed
+              </span>
+            )}
+            {file.status === "done" && file.metadata === "kept" && (
+              <span className="flex items-center gap-1 text-xs">
+                <MapPin className="w-3.5 h-3.5" aria-hidden="true" />
+                Photo metadata kept
+              </span>
+            )}
+            {file.status === "done" && file.metadata === "unsupported" && (
+              <span className="flex items-center gap-1 text-xs text-accent">
+                <MapPinOff className="w-3.5 h-3.5" aria-hidden="true" />
+                Metadata removed: AVIF can't store it
               </span>
             )}
             {file.status === "unsupported" && (
@@ -156,7 +173,7 @@ export const FileRow = memo(function FileRow({
           {busy && (
             <>
               <span className="text-sm font-medium text-primary text-center">
-                {Math.round(file.progress)}%
+                {file.waiting ? "Waiting" : `${Math.round(file.progress)}%`}
               </span>
               <button
                 onClick={() => onCancel(file.id)}
@@ -224,7 +241,7 @@ export const FileRow = memo(function FileRow({
         <div className="relative border-t border-border/60 px-4 py-3 flex flex-wrap items-end gap-4 text-sm">
           <label className="flex flex-col gap-1 text-xs text-text-muted">
             Level
-            <select
+            <Select
               value={overrides.level ?? ""}
               onChange={(e) =>
                 onOverrides(file.id, {
@@ -232,7 +249,7 @@ export const FileRow = memo(function FileRow({
                   level: (e.target.value || undefined) as FileOverrides["level"],
                 })
               }
-              className="h-9 bg-bg border border-border rounded-lg px-2 text-sm text-text"
+              className="h-9 bg-bg border border-border rounded-lg text-sm text-text"
             >
               <option value="">Same as settings</option>
               {PRESET_LEVELS.map((level) => (
@@ -240,7 +257,7 @@ export const FileRow = memo(function FileRow({
                   {level}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
           {isMedia && (
             <>

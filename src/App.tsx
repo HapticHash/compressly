@@ -34,7 +34,7 @@ import { takeSharedFiles } from "./lib/share-target";
 /** Files compressed in parallel. FFmpeg jobs are still serialized internally. */
 const CONCURRENCY = 3;
 
-type CompressionScope = "all" | "new" | "old";
+type CompressionScope = "all" | "new";
 
 function createId(): string {
   return typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -45,22 +45,32 @@ function createId(): string {
 function isInScope(f: FileItem, scope: CompressionScope): boolean {
   if (f.status === "compressing" || f.status === "unsupported") return false;
   if (scope === "new") return f.status === "idle";
-  if (scope === "old") return f.status === "done";
   return true;
 }
 
-async function runPool<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<void>,
-) {
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (next < items.length) await worker(items[next++]);
-    }),
-  );
+/** Files not compressed yet (shown under "Newly added" once others have run). */
+const isPending = (f: FileItem) => f.status === "idle" || f.status === "unsupported";
+
+/**
+ * Runs at most `limit` tasks at once. Shared by all batches, so starting a
+ * new batch while another runs doesn't multiply the work in parallel.
+ */
+function createLimiter(limit: number) {
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  return async function run<T>(task: () => Promise<T>): Promise<T> {
+    if (active >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
+    active++;
+    try {
+      return await task();
+    } finally {
+      active--;
+      waiting.shift()?.();
+    }
+  };
 }
+
+const limit = createLimiter(CONCURRENCY);
 
 function outputFile(item: FileItem): File {
   const blob = item.compressedBlob || item.file;
@@ -307,6 +317,15 @@ export default function App() {
 
   const cancelFile = useCallback((id: string) => {
     controllers.current.get(id)?.abort();
+    // A file still waiting for a slot has no running job to wind down, so
+    // return it to the queue right away.
+    setFiles((prev) =>
+      prev.map((f) =>
+        f.id === id && f.status === "compressing" && f.waiting
+          ? { ...f, status: "idle", waiting: false, progress: 0 }
+          : f,
+      ),
+    );
   }, []);
 
   const removeFile = useCallback((id: string) => {
@@ -373,6 +392,9 @@ export default function App() {
     if (selected.length === 0) return;
 
     const ids = new Set(selected.map((f) => f.id));
+    // Controllers exist from the start so files still waiting for a free slot
+    // can be cancelled too.
+    for (const id of ids) controllers.current.set(id, new AbortController());
     setSummary(null);
     setFiles((prev) =>
       prev.map((f) =>
@@ -380,11 +402,12 @@ export default function App() {
           ? {
               ...f,
               status: "compressing",
+              waiting: true,
               progress: 0,
               compressedSize: undefined,
               compressedBlob: undefined,
               keptOriginal: false,
-              metadataRemoved: false,
+              metadata: undefined,
             }
           : f,
       ),
@@ -397,11 +420,14 @@ export default function App() {
     let originalBytes = 0;
     let failed = 0;
 
-    await runPool(selected, CONCURRENCY, async (fileItem: FileItem) => {
-      const controller = new AbortController();
-      controllers.current.set(fileItem.id, controller);
+    const processFile = async (fileItem: FileItem) => {
+      const controller = controllers.current.get(fileItem.id)!;
       try {
-        const { blob, keptOriginal, metadataRemoved } = await compressFile(
+        if (controller.signal.aborted) throw new DOMException("", "AbortError");
+        setFiles((prev) =>
+          prev.map((f) => (f.id === fileItem.id ? { ...f, waiting: false } : f)),
+        );
+        const { blob, keptOriginal, metadata } = await compressFile(
           fileItem.file,
           fileItem.id,
           applyOverrides(settings, fileItem.overrides),
@@ -421,7 +447,7 @@ export default function App() {
                   compressedSize: blob.size,
                   compressedBlob: blob,
                   keptOriginal,
-                  metadataRemoved,
+                  metadata,
                 }
               : f,
           ),
@@ -442,14 +468,16 @@ export default function App() {
         setFiles((prev) =>
           prev.map((f) =>
             f.id === fileItem.id
-              ? { ...f, status: cancelled ? "idle" : "error", progress: 0 }
+              ? { ...f, status: cancelled ? "idle" : "error", waiting: false, progress: 0 }
               : f,
           ),
         );
       } finally {
         controllers.current.delete(fileItem.id);
       }
-    });
+    };
+
+    await Promise.all(selected.map((fileItem) => limit(() => processFile(fileItem))));
 
     setProcessedBytes((prev) => prev + originalBytes);
     if (processed + failed > 0) {
@@ -492,6 +520,8 @@ export default function App() {
   };
 
   const compressible = files.filter((f) => f.status !== "unsupported");
+  const newFiles = files.filter((f) => f.status === "idle");
+  const hasStarted = files.some((f) => !isPending(f));
   const isBusy =
     compressible.length === 0 ||
     compressible.every((f) => f.status === "compressing") ||
@@ -522,30 +552,29 @@ export default function App() {
     else window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
+  const primaryButton =
+    "w-full sm:w-auto h-12 px-8 rounded-full bg-primary text-on-accent hover:bg-primary-hover hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap";
+  const secondaryButton =
+    "w-full sm:w-auto h-12 px-8 rounded-full border-2 border-accent text-accent hover:bg-accent hover:text-on-accent transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap";
+
+  // New files added after a batch started: compress just those, or everything.
   const actionButtons =
-    files.some((f) => f.status === "idle") && files.some((f) => f.status === "done") ? (
-      <div className="flex flex-col gap-3 w-full sm:w-auto items-center">
+    newFiles.length > 0 && hasStarted ? (
+      <div className="flex flex-col sm:flex-row-reverse gap-3 w-full sm:w-auto items-center">
         <button
           onClick={() => handleCompression("new")}
-          disabled={isBusy}
-          className="w-full sm:w-auto h-12 px-8 rounded-full bg-primary text-on-accent hover:bg-primary-hover hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap"
+          disabled={!settingsValid}
+          className={primaryButton}
         >
-          Compress New <ArrowRight className="w-4 h-4" />
+          Compress new {newFiles.length === 1 ? "file" : `files (${newFiles.length})`}{" "}
+          <ArrowRight className="w-4 h-4" />
         </button>
-        <button
-          onClick={() => handleCompression("old")}
-          disabled={isBusy}
-          className="w-full sm:w-auto h-12 px-8 rounded-full bg-accent text-on-accent hover:bg-accent-hover hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium whitespace-nowrap"
-        >
-          Re-compress Old <ArrowRight className="w-4 h-4" />
+        <button onClick={() => handleCompression("all")} disabled={isBusy} className={secondaryButton}>
+          Re-compress all
         </button>
       </div>
     ) : (
-      <button
-        onClick={() => handleCompression("all")}
-        disabled={isBusy}
-        className="w-full sm:w-auto h-12 px-8 rounded-full bg-primary text-on-accent hover:bg-primary-hover hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium"
-      >
+      <button onClick={() => handleCompression("all")} disabled={isBusy} className={primaryButton}>
         {compressible.length > 0 && compressible.every((f) => f.status === "done")
           ? "Re-compress All"
           : compressible.length === 1
@@ -554,6 +583,30 @@ export default function App() {
         <ArrowRight className="w-4 h-4" />
       </button>
     );
+
+  const renderRows = (items: FileItem[]) =>
+    items.map((file) => (
+      <FileRow
+        key={file.id}
+        file={file}
+        canShare={canShareFiles}
+        onRemove={removeFile}
+        onCancel={cancelFile}
+        onDownload={downloadFile}
+        onShare={shareFile}
+        onCompare={openCompare}
+        onOverrides={setOverrides}
+      />
+    ));
+
+  // Once some files have been compressed (or are compressing), files added
+  // afterwards are listed separately under "Newly added".
+  const processedFiles = files.filter((f) => !isPending(f));
+  const pendingFiles = files.filter(isPending);
+  const showSections = processedFiles.length > 0 && pendingFiles.length > 0;
+  const processedTitle = processedFiles.some((f) => f.status === "compressing")
+    ? "Processing"
+    : "Compressed";
 
   return (
     <div className="min-h-screen flex flex-col items-center py-16 px-4 sm:px-6 lg:px-8 relative overflow-hidden selection:bg-primary/30">
@@ -688,21 +741,30 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-                  <AnimatePresence>
-                    {files.map((file) => (
-                      <FileRow
-                        key={file.id}
-                        file={file}
-                        canShare={canShareFiles}
-                        onRemove={removeFile}
-                        onCancel={cancelFile}
-                        onDownload={downloadFile}
-                        onShare={shareFile}
-                        onCompare={openCompare}
-                        onOverrides={setOverrides}
-                      />
-                    ))}
-                  </AnimatePresence>
+                  {showSections ? (
+                    <>
+                      <section aria-labelledby="queue-processed" className="flex flex-col gap-3">
+                        <h5
+                          id="queue-processed"
+                          className="px-2 text-xs uppercase tracking-widest font-semibold text-text-muted"
+                        >
+                          {processedTitle} ({processedFiles.length})
+                        </h5>
+                        <AnimatePresence>{renderRows(processedFiles)}</AnimatePresence>
+                      </section>
+                      <section aria-labelledby="queue-new" className="flex flex-col gap-3 mt-4">
+                        <h5
+                          id="queue-new"
+                          className="px-2 text-xs uppercase tracking-widest font-semibold text-accent"
+                        >
+                          Newly added ({pendingFiles.length})
+                        </h5>
+                        <AnimatePresence>{renderRows(pendingFiles)}</AnimatePresence>
+                      </section>
+                    </>
+                  ) : (
+                    <AnimatePresence>{renderRows(files)}</AnimatePresence>
+                  )}
                 </div>
               </motion.div>
             )}

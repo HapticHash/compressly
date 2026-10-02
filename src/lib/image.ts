@@ -3,6 +3,7 @@ import imageCompression from "browser-image-compression";
 // downloaded from a CDN, which the privacy promise rules out.
 import imageCompressionLibUrl from "browser-image-compression/dist/browser-image-compression.js?url";
 import { runWorkerJob, throwIfAborted } from "./abort";
+import { readExif, resetOrientation, writeExif } from "./metadata";
 import {
   AVIF_CUSTOM_QUALITIES,
   type CompressionSettings,
@@ -10,10 +11,18 @@ import {
   getTargetRatio,
 } from "./settings";
 
+/**
+ * What happened to the photo's EXIF data: "removed" (stripped, the default),
+ * "kept" (copied into the output), "unsupported" (the user asked to keep it
+ * but the output format can't hold it). Undefined when the original had none.
+ */
+export type MetadataOutcome = "removed" | "kept" | "unsupported";
+
 export interface ImageResult {
   blob: Blob;
   /** True when the user asked for a different format or size, so the result must be used. */
   converted: boolean;
+  metadata?: MetadataOutcome;
 }
 
 export function isHeic(file: File): boolean {
@@ -53,6 +62,11 @@ export async function compressImage(
   const ratio = getTargetRatio(settings, input.size);
   const isCustom = settings.level === "Custom";
 
+  // Read EXIF from the original (before any HEIC conversion, which drops it).
+  const exif = await readExif(file).catch(() => null);
+  throwIfAborted(signal);
+
+  let blob: Blob;
   if (outputType === "image/avif") {
     const worker = new Worker(new URL("./avif.worker.ts", import.meta.url), {
       type: "module",
@@ -71,27 +85,34 @@ export async function compressImage(
       onProgress,
       signal,
     );
-    return { blob: new Blob([buffer], { type: "image/avif" }), converted: true };
+    blob = new Blob([buffer], { type: "image/avif" });
+  } else {
+    const targetMB = (input.size * ratio) / (1024 * 1024);
+    blob = await imageCompression(input, {
+      // Undershoot custom targets by 25% so the result stays under them.
+      maxSizeMB: Math.max(isCustom ? targetMB * 0.75 : targetMB, 0.01),
+      maxWidthOrHeight: maxDimension ?? undefined,
+      // Low/Medium keep the original dimensions; stronger levels may downscale,
+      // which is the only way lossless formats like PNG get meaningfully smaller.
+      alwaysKeepResolution:
+        maxDimension === null &&
+        (settings.level === "Low" || settings.level === "Medium"),
+      fileType: outputType,
+      // Metadata is handled below for every format, not just JPEG to JPEG.
+      preserveExif: false,
+      useWebWorker: true,
+      libURL: new URL(imageCompressionLibUrl, location.href).href,
+      maxIteration: 30,
+      initialQuality: isCustom ? 0.6 : 0.8,
+      signal,
+      onProgress,
+    });
   }
 
-  const targetMB = (input.size * ratio) / (1024 * 1024);
-  const blob = await imageCompression(input, {
-    // Undershoot custom targets by 25% so the result stays under them.
-    maxSizeMB: Math.max(isCustom ? targetMB * 0.75 : targetMB, 0.01),
-    maxWidthOrHeight: maxDimension ?? undefined,
-    // Low/Medium keep the original dimensions; stronger levels may downscale,
-    // which is the only way lossless formats like PNG get meaningfully smaller.
-    alwaysKeepResolution:
-      maxDimension === null &&
-      (settings.level === "Low" || settings.level === "Medium"),
-    fileType: outputType,
-    preserveExif: keepMetadata,
-    useWebWorker: true,
-    libURL: new URL(imageCompressionLibUrl, location.href).href,
-    maxIteration: 30,
-    initialQuality: isCustom ? 0.6 : 0.8,
-    signal,
-    onProgress,
-  });
-  return { blob, converted };
+  if (!exif) return { blob, converted };
+  if (!keepMetadata) return { blob, converted, metadata: "removed" };
+  const withExif = await writeExif(blob, resetOrientation(exif));
+  return withExif
+    ? { blob: withExif, converted, metadata: "kept" }
+    : { blob, converted, metadata: "unsupported" };
 }

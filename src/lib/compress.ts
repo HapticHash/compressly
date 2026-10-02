@@ -1,3 +1,4 @@
+import type { MetadataOutcome } from "./image";
 import type { CompressionSettings, FileOverrides } from "./settings";
 
 export type FileKind = "image" | "gif" | "svg" | "media" | "pdf";
@@ -41,8 +42,8 @@ export interface CompressResult {
   blob: Blob;
   /** True when compression didn't make the file smaller, so the original is returned. */
   keptOriginal: boolean;
-  /** True when image metadata such as GPS location was stripped. */
-  metadataRemoved: boolean;
+  /** What happened to the photo's EXIF data (images only). */
+  metadata?: MetadataOutcome;
 }
 
 /** Each compressor is loaded on demand so its library stays out of the main bundle. */
@@ -59,6 +60,7 @@ export async function compressFile(
   // A conversion the user asked for (new format, size or length) is always
   // returned, even when it isn't smaller than the original.
   let converted = false;
+  let metadata: MetadataOutcome | undefined;
   switch (kind) {
     case "image": {
       const result = await (await import("./image")).compressImage(
@@ -67,7 +69,7 @@ export async function compressFile(
         onProgress,
         signal,
       );
-      ({ blob, converted } = result);
+      ({ blob, converted, metadata } = result);
       break;
     }
     case "gif":
@@ -100,15 +102,16 @@ export async function compressFile(
       throw new Error(`Unsupported file type: ${file.type || "unknown"}`);
   }
   if (!converted && blob.size >= file.size) {
-    return { blob: file, keptOriginal: true, metadataRemoved: false };
+    // Compression didn't help, so return the original. For photos, still
+    // honour the metadata setting by stripping EXIF/XMP losslessly.
+    if (kind === "image" && !settings.image.keepMetadata) {
+      const { stripMetadata } = await import("./metadata");
+      const stripped = await stripMetadata(file);
+      if (stripped) return { blob: stripped, keptOriginal: true, metadata: "removed" };
+    }
+    return { blob: file, keptOriginal: true };
   }
-  return {
-    blob,
-    keptOriginal: false,
-    metadataRemoved:
-      kind === "image" &&
-      !(settings.image.keepMetadata && file.type === "image/jpeg" && blob.type === "image/jpeg"),
-  };
+  return { blob, keptOriginal: false, metadata };
 }
 
 export async function createZip(
