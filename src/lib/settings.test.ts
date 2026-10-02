@@ -26,6 +26,12 @@ describe("parseTarget", () => {
       expect(parseTarget(value)).toBeNull();
     }
   });
+
+  it("rejects targets under 1 KB", () => {
+    expect(parseTarget("0.0000001", "KB")).toBeNull();
+    expect(parseTarget("0.5", "KB")).toBeNull();
+    expect(parseTarget("1", "KB")).toBe(1024);
+  });
 });
 
 describe("getScaleFilter", () => {
@@ -43,10 +49,10 @@ describe("settings", () => {
     expect(isSettingsValid({ level: "High", targetBytes: null })).toBe(true);
   });
 
-  it("computes the custom ratio per file, capped at 0.9", () => {
+  it("computes the custom ratio per file, capped at 1", () => {
     const settings = { level: "Custom" as const, targetBytes: 2 * MB };
     expect(getTargetRatio(settings, 10 * MB)).toBeCloseTo(0.2);
-    expect(getTargetRatio(settings, 1 * MB)).toBe(0.9);
+    expect(getTargetRatio(settings, 1 * MB)).toBe(1);
   });
 
   it("maps levels to CRF and clamps custom CRF to 18..51", () => {
@@ -71,6 +77,12 @@ describe("estimateSavings", () => {
     });
     expect(estimate?.saved).toBeCloseTo(16 * MB);
     expect(estimate?.percentage).toBe(80);
+  });
+
+  it("expects no savings when the target is above the file size", () => {
+    const estimate = estimateSavings([MB], { level: "Custom", targetBytes: 10 * MB });
+    expect(estimate?.saved).toBe(0);
+    expect(estimate?.percentage).toBe(0);
   });
 
   it("returns null without files or a valid target", () => {

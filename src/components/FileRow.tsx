@@ -1,4 +1,5 @@
 import { memo, useState } from "react";
+import { Select } from "./Select";
 import { motion } from "motion/react";
 import {
   Columns2,
@@ -6,6 +7,7 @@ import {
   File,
   FileText,
   Image as ImageIcon,
+  MapPin,
   MapPinOff,
   Music,
   Share2,
@@ -15,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import type { FileKind } from "../lib/compress";
+import type { MetadataOutcome } from "../lib/image";
 import { type FileOverrides, PRESET_LEVELS, formatSize } from "../lib/settings";
 
 export interface FileItem {
@@ -23,10 +26,19 @@ export interface FileItem {
   kind: FileKind | null;
   status: "idle" | "compressing" | "done" | "error" | "unsupported";
   progress: number;
+  /** Compressing, but still waiting for a free slot. */
+  waiting?: boolean;
   originalSize: number;
   compressedSize?: number;
   keptOriginal?: boolean;
-  metadataRemoved?: boolean;
+  /** The original already met the Custom target, so it was left as is. */
+  underTarget?: boolean;
+  /** The Custom target in bytes, when the result is still larger. */
+  missedTarget?: number;
+  missedTargetHint?: string;
+  /** Why the file failed or can't be compressed, for the user. */
+  error?: string;
+  metadata?: MetadataOutcome;
   previewUrl?: string;
   compressedBlob?: Blob;
   overrides?: FileOverrides;
@@ -123,7 +135,17 @@ export const FileRow = memo(function FileRow({
           <div className="flex flex-col text-xs sm:text-sm text-text-muted gap-0.5">
             <span>Original: {formatSize(file.originalSize)}</span>
             {file.status === "done" && file.keptOriginal && (
-              <span className="text-text">Already optimized, original kept</span>
+              <span className="text-text">
+                {file.underTarget
+                  ? "Already under your target, original kept"
+                  : "Already optimized, original kept"}
+              </span>
+            )}
+            {file.status === "done" && file.missedTarget !== undefined && (
+              <span className="text-xs text-accent">
+                Couldn't get under {formatSize(file.missedTarget)}; this is as small as it gets.
+                {file.missedTargetHint && ` ${file.missedTargetHint}`}
+              </span>
             )}
             {file.status === "done" && !file.keptOriginal && file.compressedSize !== undefined && (
               <div className="flex items-center gap-2 flex-wrap">
@@ -136,16 +158,30 @@ export const FileRow = memo(function FileRow({
                 </span>
               </div>
             )}
-            {file.status === "done" && file.metadataRemoved && (
+            {file.status === "done" && file.metadata === "removed" && (
               <span className="flex items-center gap-1 text-xs">
                 <MapPinOff className="w-3.5 h-3.5" aria-hidden="true" />
                 Location &amp; camera data removed
               </span>
             )}
-            {file.status === "unsupported" && (
-              <span className="text-accent">File type not supported</span>
+            {file.status === "done" && file.metadata === "kept" && (
+              <span className="flex items-center gap-1 text-xs">
+                <MapPin className="w-3.5 h-3.5" aria-hidden="true" />
+                Photo metadata kept
+              </span>
             )}
-            {file.status === "error" && <span className="text-danger">Compression failed</span>}
+            {file.status === "done" && file.metadata === "unsupported" && (
+              <span className="flex items-center gap-1 text-xs text-accent">
+                <MapPinOff className="w-3.5 h-3.5" aria-hidden="true" />
+                Metadata removed: AVIF can't store it
+              </span>
+            )}
+            {file.status === "unsupported" && (
+              <span className="text-accent">{file.error ?? "File type not supported"}</span>
+            )}
+            {file.status === "error" && (
+              <span className="text-danger">{file.error ?? "Compression failed"}</span>
+            )}
             {overrides.level && (
               <span className="text-xs">Level for this file: {overrides.level}</span>
             )}
@@ -156,7 +192,7 @@ export const FileRow = memo(function FileRow({
           {busy && (
             <>
               <span className="text-sm font-medium text-primary text-center">
-                {Math.round(file.progress)}%
+                {file.waiting ? "Waiting" : `${Math.round(file.progress)}%`}
               </span>
               <button
                 onClick={() => onCancel(file.id)}
@@ -224,7 +260,7 @@ export const FileRow = memo(function FileRow({
         <div className="relative border-t border-border/60 px-4 py-3 flex flex-wrap items-end gap-4 text-sm">
           <label className="flex flex-col gap-1 text-xs text-text-muted">
             Level
-            <select
+            <Select
               value={overrides.level ?? ""}
               onChange={(e) =>
                 onOverrides(file.id, {
@@ -232,7 +268,7 @@ export const FileRow = memo(function FileRow({
                   level: (e.target.value || undefined) as FileOverrides["level"],
                 })
               }
-              className="h-9 bg-bg border border-border rounded-lg px-2 text-sm text-text"
+              className="h-9 bg-bg border border-border rounded-lg text-sm text-text"
             >
               <option value="">Same as settings</option>
               {PRESET_LEVELS.map((level) => (
@@ -240,7 +276,7 @@ export const FileRow = memo(function FileRow({
                   {level}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
           {isMedia && (
             <>
@@ -276,6 +312,13 @@ export const FileRow = memo(function FileRow({
               </label>
             </>
           )}
+          {isMedia &&
+            overrides.trimEnd !== undefined &&
+            overrides.trimEnd <= (overrides.trimStart ?? 0) && (
+              <p role="alert" className="text-xs text-danger basis-full">
+                The end must be after the start.
+              </p>
+            )}
           <p className="text-xs text-text-muted basis-full">
             Changes apply the next time this file is compressed.
           </p>

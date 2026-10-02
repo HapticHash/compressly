@@ -49,7 +49,8 @@ test('converts images to AVIF and WebP and compares before/after', async ({ page
   await page.getByRole('button', { name: 'Compress', exact: true }).click();
   await waitForQueue(page);
   expect((await download(page, 'photo.jpg')).name).toBe('compressed_photo.avif');
-  await expect(rowFor(page, 'photo.jpg')).toContainText('Location & camera data removed');
+  // The generated photo has no EXIF, so there is nothing to report removing.
+  await expect(rowFor(page, 'photo.jpg')).not.toContainText('Location & camera data removed');
 
   await rowFor(page, 'photo.jpg').getByRole('button', { name: /^Compare/ }).click();
   await expect(page.getByRole('dialog').locator('img')).toHaveCount(2);
@@ -154,4 +155,101 @@ test('receives files shared from other apps', async ({ page }) => {
   });
   await page.goto('/?shared=1');
   await expect(rowFor(page, 'shared.svg')).toBeVisible();
+});
+
+test('keeps or removes photo metadata as chosen', async ({ page, files }) => {
+  const { readExif, writeExif } = await import('../../src/lib/metadata');
+  // IFD0 with Make = "Cam" so the block is non-trivial.
+  const tiff = new Uint8Array([
+    0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x0f, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x43, 0x61, 0x6d, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+  ]);
+  const tagged = await writeExif(new Blob([files.jpg.buffer], { type: 'image/jpeg' }), tiff);
+  const photo = { name: 'tagged.jpg', mimeType: 'image/jpeg', buffer: Buffer.from(await tagged!.arrayBuffer()) };
+  const exifOf = async (bytes: Buffer, type: string) => readExif(new Blob([bytes], { type }));
+
+  await page.setInputFiles('input[type="file"]', [photo]);
+  await page.getByRole('button', { name: 'Compress', exact: true }).click();
+  await waitForQueue(page);
+  await expect(rowFor(page, 'tagged.jpg')).toContainText('Location & camera data removed');
+  expect(await exifOf((await download(page, 'tagged.jpg')).bytes, 'image/jpeg')).toBeNull();
+
+  await page.getByLabel(/Keep photo metadata/).check();
+  for (const format of ['original', 'webp'] as const) {
+    await page.selectOption('#image-format', format);
+    await page.getByRole('button', { name: 'Re-compress All', exact: true }).click();
+    await waitForQueue(page);
+    await expect(rowFor(page, 'tagged.jpg')).toContainText('Photo metadata kept');
+    const out = await download(page, 'tagged.jpg');
+    expect(await exifOf(out.bytes, format === 'webp' ? 'image/webp' : 'image/jpeg')).not.toBeNull();
+  }
+});
+
+test('files added mid-run get their own section and button', async ({ page, files }) => {
+  await page.setInputFiles('input[type="file"]', [files.jpg, files.png].map(toFile));
+  await page.selectOption('#image-format', 'avif');
+  await page.getByRole('button', { name: 'Compress All', exact: true }).click();
+  await page.setInputFiles('input[type="file"]', [toFile(files.svg)]);
+  await expect(page.getByRole('heading', { name: /^Processing \(2\)$/ })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /^Newly added \(1\)$/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Re-compress all' })).toBeVisible();
+  await page.getByRole('button', { name: /^Compress new file/ }).click();
+  await waitForQueue(page);
+  await expect(rowFor(page, 'icon.svg')).toContainText('New:');
+  await expect(page.getByRole('heading', { name: /Newly added/ })).toHaveCount(0);
+});
+
+test('explains why broken files fail', async ({ page }) => {
+  await page.goto('/');
+  await page.setInputFiles('input[type="file"]', [
+    { name: 'empty.jpg', mimeType: 'image/jpeg', buffer: Buffer.alloc(0) },
+    { name: 'fake.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('not an image') },
+    { name: 'broken.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.7\ngarbage') },
+  ]);
+  await expect(rowFor(page, 'empty.jpg')).toContainText('This file is empty.');
+  await page.getByRole('button', { name: 'Compress All', exact: true }).click();
+  await waitForQueue(page);
+  await expect(rowFor(page, 'fake.jpg')).toContainText("Couldn't read this image");
+  await expect(rowFor(page, 'broken.pdf')).toContainText("Couldn't read this PDF");
+});
+
+test('custom targets: keeps files already under, rejects tiny ones, fits PDFs', async ({ page, files }) => {
+  await page.setInputFiles('input[type="file"]', [toFile(files.jpg), toFile(files.pdf)]);
+  await page.getByRole('button', { name: 'Custom', exact: true }).click();
+
+  await page.fill('#target-size', '0.0001');
+  await page.selectOption('select[aria-label="Target size unit"]', 'KB');
+  await expect(page.getByRole('button', { name: 'Compress All', exact: true })).toBeDisabled();
+
+  // Above both files' sizes: nothing should be re-encoded.
+  await page.fill('#target-size', '50');
+  await page.selectOption('select[aria-label="Target size unit"]', 'MB');
+  await page.getByRole('button', { name: 'Compress All', exact: true }).click();
+  await waitForQueue(page);
+  await expect(rowFor(page, 'photo.jpg')).toContainText('Already under your target');
+
+  // A PDF target should be met without collapsing far below it.
+  await page.getByRole('button', { name: 'Smallest size' }).click();
+  await page.fill('#target-size', '150');
+  await page.selectOption('select[aria-label="Target size unit"]', 'KB');
+  await page.getByRole('button', { name: 'Re-compress All', exact: true }).click();
+  await waitForQueue(page);
+  const pdf = await download(page, 'doc.pdf');
+  expect(pdf.bytes.length).toBeLessThanOrEqual(150 * 1024);
+  expect(pdf.bytes.length).toBeGreaterThan(30 * 1024);
+});
+
+test('rejects trims outside the clip', async ({ page, files }) => {
+  await page.setInputFiles('input[type="file"]', [toFile(files.webm)]);
+  const row = rowFor(page, 'clip.webm');
+  await row.getByRole('button', { name: /^Options/ }).click();
+  await row.getByLabel('Start (seconds)').fill('2');
+  await row.getByLabel('End (seconds)').fill('1');
+  await expect(row.getByRole('alert')).toContainText('The end must be after the start.');
+  await row.getByLabel('Start (seconds)').fill('60');
+  await row.getByLabel('End (seconds)').fill('');
+  await page.getByRole('button', { name: 'Compress', exact: true }).click();
+  await waitForQueue(page);
+  await expect(row).toContainText('is past the end of the clip');
 });

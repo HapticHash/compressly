@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Activity, FileText, Image as ImageIcon, Settings, Video } from "lucide-react";
+import { Select } from "./Select";
 import type { StoredSettings } from "../hooks/useSettings";
 import {
   LEVELS,
@@ -13,7 +14,7 @@ import {
 const LABEL_CLASS =
   "block text-xs uppercase tracking-widest text-text-muted mb-3 font-semibold";
 const SELECT_CLASS =
-  "w-full h-11 bg-bg border border-border rounded-xl px-3 text-sm text-text focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary";
+  "h-11 bg-bg border border-border rounded-xl text-sm text-text focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary";
 
 function Segmented<T extends string>({
   label,
@@ -67,6 +68,7 @@ interface SettingsPanelProps {
   update: (patch: Partial<StoredSettings>) => void;
   targetValid: boolean;
   estimate: { saved: number; percentage: number } | null;
+  estimateLabel: string;
   kinds: { image: boolean; pdf: boolean; video: boolean };
   actions: ReactNode;
 }
@@ -76,6 +78,7 @@ export function SettingsPanel({
   update,
   targetValid,
   estimate,
+  estimateLabel,
   kinds,
   actions,
 }: SettingsPanelProps) {
@@ -122,15 +125,16 @@ export function SettingsPanel({
                   aria-describedby="target-size-hint"
                   className="flex-1 min-w-0 h-12 bg-bg border border-border rounded-2xl px-4 text-sm focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all text-text"
                 />
-                <select
+                <Select
                   aria-label="Target size unit"
                   value={stored.targetUnit}
                   onChange={(e) => update({ targetUnit: e.target.value as "KB" | "MB" })}
-                  className="h-12 bg-bg border border-border rounded-2xl px-3 text-sm text-text"
+                  wrapperClassName="shrink-0"
+                  className="h-12 bg-bg border border-border rounded-2xl text-sm text-text focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary"
                 >
                   <option value="KB">KB</option>
                   <option value="MB">MB</option>
-                </select>
+                </Select>
               </div>
               <div className="flex flex-wrap gap-2 mt-3" role="group" aria-label="Common targets">
                 {TARGET_PRESETS.map((preset) => {
@@ -154,7 +158,7 @@ export function SettingsPanel({
               </div>
               {!targetValid && (
                 <p id="target-size-hint" className="mt-2 text-xs text-accent">
-                  Enter a target size greater than 0.
+                  Enter a target between 1 KB and 100 GB.
                 </p>
               )}
             </motion.div>
@@ -168,7 +172,7 @@ export function SettingsPanel({
                 <label htmlFor="image-format" className={LABEL_CLASS}>
                   Output format
                 </label>
-                <select
+                <Select
                   id="image-format"
                   className={SELECT_CLASS}
                   value={stored.image.format}
@@ -180,13 +184,13 @@ export function SettingsPanel({
                   <option value="jpeg">JPG (works everywhere)</option>
                   <option value="webp">WebP (smaller)</option>
                   <option value="avif">AVIF (smallest, slower)</option>
-                </select>
+                </Select>
               </div>
               <div>
                 <label htmlFor="image-size" className={LABEL_CLASS}>
                   Max size
                 </label>
-                <select
+                <Select
                   id="image-size"
                   className={SELECT_CLASS}
                   value={stored.image.maxDimension ?? ""}
@@ -205,7 +209,7 @@ export function SettingsPanel({
                       Longest side {size}px
                     </option>
                   ))}
-                </select>
+                </Select>
               </div>
             </div>
             <label className="flex items-start gap-3 mt-4 text-sm text-text cursor-pointer">
@@ -221,7 +225,7 @@ export function SettingsPanel({
                 Keep photo metadata
                 <span className="block text-xs text-text-muted">
                   Camera, date and GPS location. Off by default so your location isn't shared.
-                  Only kept for JPG to JPG.
+                  Kept for JPG, PNG and WebP output; AVIF can't store it.
                 </span>
               </span>
             </label>
@@ -254,7 +258,7 @@ export function SettingsPanel({
                 <label htmlFor="video-format" className={LABEL_CLASS}>
                   Format
                 </label>
-                <select
+                <Select
                   id="video-format"
                   className={SELECT_CLASS}
                   value={stored.video.format}
@@ -265,13 +269,13 @@ export function SettingsPanel({
                   <option value="mp4">MP4 (works everywhere)</option>
                   <option value="webm">WebM (smaller, for the web)</option>
                   <option value="gif">GIF (animated image)</option>
-                </select>
+                </Select>
               </div>
               <div>
                 <label htmlFor="video-resolution" className={LABEL_CLASS}>
                   Resolution
                 </label>
-                <select
+                <Select
                   id="video-resolution"
                   className={SELECT_CLASS}
                   value={stored.video.resolution ?? ""}
@@ -290,7 +294,7 @@ export function SettingsPanel({
                       {r}p
                     </option>
                   ))}
-                </select>
+                </Select>
               </div>
             </div>
             {stored.video.format !== "gif" && (
@@ -316,12 +320,16 @@ export function SettingsPanel({
           <div className="w-full text-sm text-text-muted flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2 bg-primary/5 p-3.5 rounded-xl border border-primary/10">
             <div className="flex items-center gap-2">
               <Activity className="w-4 h-4 text-primary shrink-0" />
-              <span>Estimated savings:</span>
+              <span>{estimateLabel}:</span>
             </div>
-            <div className="flex items-center gap-1">
-              <span className="font-semibold text-primary-dark">{formatSize(estimate.saved)}</span>
-              <span>({estimate.percentage}%)</span>
-            </div>
+            {estimate.saved > 0 ? (
+              <div className="flex items-center gap-1">
+                <span className="font-semibold text-primary-dark">≈ {formatSize(estimate.saved)}</span>
+                <span>({estimate.percentage}%)</span>
+              </div>
+            ) : (
+              <span>none, the files are already within your target</span>
+            )}
           </div>
         )}
 
