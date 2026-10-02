@@ -7,9 +7,21 @@ compatibility_date = "2026-03-08"
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-# API routes must hit the Worker instead of the SPA fallback.
-run_worker_first = ["/api/*"]
+# API routes (and share-target POSTs before the service worker is installed)
+# must hit the Worker instead of the SPA fallback.
+run_worker_first = ["/api/*", "/share-target"]
 
+# Global stats counter. Durable Objects process one request at a time, so
+# concurrent reports can't overwrite each other.
+[[durable_objects.bindings]]
+name = "STATS_COUNTER"
+class_name = "StatsCounter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StatsCounter"]
+
+# Previous stats store; read once by StatsCounter to carry the totals over.
 [[kv_namespaces]]
 binding = "COMPRESSLY_STATS"
 id = "add246b862564e07a8dcc43de5b38c78"

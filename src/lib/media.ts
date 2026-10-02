@@ -1,15 +1,25 @@
 import type { FFmpeg } from "@ffmpeg/ffmpeg";
+import { abortError, throwIfAborted } from "./abort";
 import {
   type CompressionSettings,
+  type FileOverrides,
   getAudioBitrateKbps,
+  getGifColors,
+  getScaleFilter,
   getTargetRatio,
   getVideoBitrateForTarget,
   getVideoCrf,
+  getVp8Crf,
 } from "./settings";
 
 // Pinned to the same version as the core the @ffmpeg/ffmpeg wrapper expects.
-// The ~31 MB wasm is too large to deploy on Cloudflare Pages (25 MiB file limit),
-// so it is fetched from the CDN, but only once a video or audio file is added.
+// The ~31 MB wasm is too large to deploy on Cloudflare (25 MiB file limit),
+// so it is fetched from the CDN, once a video or audio file is added. The
+// service worker caches it after the first download.
+//
+// The multi-threaded core (@ffmpeg/core-mt) was tried: it crashes with
+// "null function or function signature mismatch" in Chromium on simple
+// encodes, so the single-threaded core is used.
 const CORE_BASE_URL = "https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm";
 
 let ffmpegPromise: Promise<FFmpeg> | null = null;
@@ -24,14 +34,8 @@ export function loadFFmpeg(): Promise<FFmpeg> {
       ]);
       const ffmpeg = new FFmpeg();
       await ffmpeg.load({
-        coreURL: await toBlobURL(
-          `${CORE_BASE_URL}/ffmpeg-core.js`,
-          "text/javascript",
-        ),
-        wasmURL: await toBlobURL(
-          `${CORE_BASE_URL}/ffmpeg-core.wasm`,
-          "application/wasm",
-        ),
+        coreURL: await toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.js`, "text/javascript"),
+        wasmURL: await toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.wasm`, "application/wasm"),
       });
       return ffmpeg;
     })();
@@ -76,82 +80,148 @@ function getMediaDuration(file: File): Promise<number | null> {
   });
 }
 
+const OUTPUT = {
+  mp4: { ext: "mp4", type: "video/mp4" },
+  webm: { ext: "webm", type: "video/webm" },
+  gif: { ext: "gif", type: "image/gif" },
+  audio: { ext: "mp3", type: "audio/mpeg" },
+} as const;
+
+export interface MediaResult {
+  blob: Blob;
+  /** True when the user changed format, size or length, so the result must be used. */
+  converted: boolean;
+}
+
 export async function compressMedia(
   file: File,
   id: string,
   settings: CompressionSettings,
+  overrides: FileOverrides | undefined,
   onProgress: (percent: number) => void,
-): Promise<Blob> {
+  signal?: AbortSignal,
+): Promise<MediaResult> {
   const isVideo = file.type.startsWith("video/");
+  const { format, resolution, removeAudio } = settings.video;
+  const output = isVideo ? OUTPUT[format] : OUTPUT.audio;
   const ratio = getTargetRatio(settings, file.size);
+  const trimStart = overrides?.trimStart && overrides.trimStart > 0 ? overrides.trimStart : null;
+  const trimEnd =
+    overrides?.trimEnd && overrides.trimEnd > (trimStart ?? 0) ? overrides.trimEnd : null;
+
+  const needsDuration = isVideo && settings.level === "Custom" && settings.targetBytes;
+  const fullDuration = needsDuration ? await getMediaDuration(file) : null;
   const duration =
-    isVideo && settings.level === "Custom" && settings.targetBytes
-      ? await getMediaDuration(file)
-      : null;
-  const [ffmpeg, { fetchFile }] = await Promise.all([
-    loadFFmpeg(),
-    import("@ffmpeg/util"),
-  ]);
+    fullDuration === null
+      ? null
+      : (trimEnd ?? fullDuration) - (trimStart ?? 0);
+  const { fetchFile } = await import("@ffmpeg/util");
+  throwIfAborted(signal);
 
   return runExclusive(async () => {
+    throwIfAborted(signal);
+    const ffmpeg = await loadFFmpeg();
     const inputName = `input_${id}.${getExtension(file.name)}`;
-    const outputName = `output_${id}.${isVideo ? "mp4" : "mp3"}`;
+    const outputName = `output_${id}.${output.ext}`;
 
-    let args: string[];
-    if (isVideo) {
-      const audioKbps = 96;
-      const video: string[] =
-        duration && settings.targetBytes
-          ? (() => {
-              const kbps = getVideoBitrateForTarget(
-                settings.targetBytes,
-                duration,
-                audioKbps,
-              );
-              return [
-                "-b:v", `${kbps}k`,
-                "-maxrate", `${kbps}k`,
-                "-bufsize", `${kbps * 2}k`,
-              ];
-            })()
-          : ["-crf", String(getVideoCrf(settings.level, ratio))];
-      args = [
-        "-i", inputName,
-        "-c:v", "libx264",
-        ...video,
-        "-preset", "veryfast",
-        ...(settings.level === "Extreme"
-          ? ["-vf", "scale='min(1280,iw)':-2"]
-          : []),
-        "-c:a", "aac",
-        "-b:a", `${audioKbps}k`,
-        "-movflags", "+faststart",
-        outputName,
-      ];
+    const args: string[] = [];
+    // -ss before -i seeks quickly; -t then counts from the new start.
+    if (trimStart !== null) args.push("-ss", String(trimStart));
+    args.push("-i", inputName);
+    if (trimEnd !== null) args.push("-t", String(trimEnd - (trimStart ?? 0)));
+
+    if (!isVideo) {
+      args.push("-vn", "-b:a", `${getAudioBitrateKbps(settings.level, ratio)}k`);
+    } else if (format === "gif") {
+      const width = resolution ? getScaleFilter(resolution) : "scale='min(480,iw)':-2";
+      const colors = getGifColors(settings.level, ratio);
+      args.push(
+        "-filter_complex",
+        `fps=12,${width}:flags=lanczos,split[a][b];` +
+          `[a]palettegen=max_colors=${colors}[p];[b][p]paletteuse=dither=bayer`,
+        "-loop", "0",
+      );
     } else {
-      const kbps = getAudioBitrateKbps(settings.level, ratio);
-      args = ["-i", inputName, "-vn", "-b:a", `${kbps}k`, outputName];
+      const audioKbps = 96;
+      const targetKbps =
+        duration && settings.targetBytes
+          ? getVideoBitrateForTarget(
+              settings.targetBytes,
+              duration,
+              removeAudio ? 0 : audioKbps,
+            )
+          : null;
+      const filters: string[] = [];
+      if (resolution) filters.push(getScaleFilter(resolution));
+      else if (settings.level === "Extreme") filters.push(getScaleFilter(720));
+      if (filters.length) args.push("-vf", filters.join(","));
+
+      if (format === "webm") {
+        // VP8 rather than VP9: libvpx-vp9 hangs in the WebAssembly build.
+        // With VP8, -crf sets quality and -b:v is the upper bitrate bound.
+        args.push(
+          "-c:v", "libvpx",
+          ...(targetKbps
+            ? ["-b:v", `${targetKbps}k`]
+            : ["-crf", String(getVp8Crf(settings.level, ratio)), "-b:v", "8M"]),
+          "-deadline", "realtime",
+          "-cpu-used", "8",
+        );
+        args.push(...(removeAudio ? ["-an"] : ["-c:a", "libopus", "-b:a", `${audioKbps}k`]));
+      } else {
+        args.push(
+          "-c:v", "libx264",
+          ...(targetKbps
+            ? ["-b:v", `${targetKbps}k`, "-maxrate", `${targetKbps}k`, "-bufsize", `${targetKbps * 2}k`]
+            : ["-crf", String(getVideoCrf(settings.level, ratio))]),
+          "-preset", "veryfast",
+          "-pix_fmt", "yuv420p",
+          "-movflags", "+faststart",
+        );
+        args.push(...(removeAudio ? ["-an"] : ["-c:a", "aac", "-b:a", `${audioKbps}k`]));
+      }
     }
+    args.push(outputName);
 
     const handleProgress = ({ progress }: { progress: number }) => {
       if (Number.isFinite(progress)) {
         onProgress(Math.min(100, Math.max(0, Math.round(progress * 100))));
       }
     };
+    // FFmpeg can't interrupt a running command; terminating the worker is the
+    // only way. The next job loads a fresh instance.
+    const onAbort = () => {
+      ffmpeg.terminate();
+      ffmpegPromise = null;
+    };
 
     ffmpeg.on("progress", handleProgress);
+    signal?.addEventListener("abort", onAbort);
     try {
       await ffmpeg.writeFile(inputName, await fetchFile(file));
       const exitCode = await ffmpeg.exec(args);
+      throwIfAborted(signal);
       if (exitCode !== 0) {
         throw new Error(`FFmpeg exited with code ${exitCode}`);
       }
       const data = (await ffmpeg.readFile(outputName)) as Uint8Array;
-      return new Blob([data], { type: isVideo ? "video/mp4" : "audio/mpeg" });
+      return {
+        blob: new Blob([data], { type: output.type }),
+        converted:
+          trimStart !== null ||
+          trimEnd !== null ||
+          (isVideo && (format !== "mp4" || resolution !== null || removeAudio)),
+      };
+    } catch (error) {
+      if (signal?.aborted) throw abortError();
+      throw error;
     } finally {
-      ffmpeg.off("progress", handleProgress);
-      await ffmpeg.deleteFile(inputName).catch(() => {});
-      await ffmpeg.deleteFile(outputName).catch(() => {});
+      signal?.removeEventListener("abort", onAbort);
+      if (!signal?.aborted) {
+        ffmpeg.off("progress", handleProgress);
+        await ffmpeg.deleteFile(inputName).catch(() => {});
+        await ffmpeg.deleteFile(outputName).catch(() => {});
+      }
     }
   });
 }

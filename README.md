@@ -25,12 +25,14 @@ Compressly is a **privacy-first file compression tool** that lets you reduce fil
 
 ## ✨ Features
 
-- **🎚️ Compression Level Control** — Choose how aggressively to compress, from lossless to maximum reduction.
-- **🎯 Target File Size** — Set an exact target size and let Compressly do the math for you.
-- **🔒 Privacy First** — Files are processed locally or on the edge. Nothing is stored or logged on a remote server.
-- **⚡ Fast & Lightweight** — Built with Vite and TypeScript for a snappy, modern experience.
-- **☁️ Edge-Powered API** — Backend API runs on Cloudflare Workers for low-latency processing close to you.
-- **🖥️ Clean UI** — A minimal, distraction-free interface designed for creators.
+- **🎚️ Compression levels and exact targets** — Pick a level, or set a target size per file. One-click presets for WhatsApp (16 MB), Discord (10 MB), email (25 MB) and form uploads (200 KB / 100 KB).
+- **🖼️ Images** — JPG, PNG, WebP, BMP and iPhone HEIC in; same format, JPG, WebP or AVIF out. Optional max dimensions. Before/after comparison slider.
+- **📄 PDFs** — "Keep text selectable" re-compresses only the images inside, or "Smallest size" turns pages into images.
+- **🎬 Video and audio** — MP4, WebM or GIF output, resolution, remove audio, trim. Audio becomes MP3.
+- **🎞️ GIF and SVG** — Animated GIFs keep every frame (gifsicle); SVGs are optimized with SVGO.
+- **🔒 Private by design** — Everything runs in your browser. Photo location and camera data is removed unless you choose to keep it.
+- **📱 Installable app** — Works offline once loaded; on Android, share files to Compressly from any app.
+- **✨ Comfortable to use** — Paste or drop whole folders, cancel any file, per-file options, remembered settings, dark mode.
 
 ---
 
@@ -72,9 +74,12 @@ The app will be available at `http://localhost:3000` by default.
 ### Checks
 
 ```bash
-npm run lint   # type-check
-npm test       # unit tests
+npm run lint       # type-check
+npm test           # unit tests
+npm run test:e2e   # browser tests against the production build (Playwright)
 ```
+
+Run `npx playwright install chromium` once before the browser tests.
 
 ### Building for Production
 
@@ -97,7 +102,16 @@ npx wrangler deploy
 
 With Workers Builds (Git integration), use `npm run build` as the build command and `npx wrangler deploy` (or `npx wrangler versions upload`) as the deploy command.
 
-To run the production setup locally, including the API and KV stats:
+Use `npx wrangler deploy` rather than `npx wrangler versions upload`: the stats counter is a Durable Object, and the first deploy has to apply its migration, which version uploads can't do.
+
+Optional build-time environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `VITE_SITE_URL` | Public URL used in canonical links, `og:image` and `sitemap.xml` (default: `https://compressly.harshitks2203.workers.dev`) |
+| `CF_ANALYTICS_TOKEN` | Enables Cloudflare Web Analytics |
+
+To run the production setup locally, including the API and stats counter:
 
 ```bash
 npm run build
@@ -112,11 +126,15 @@ npx wrangler dev
 compressly/
 ├── docs/
 │   └── screenshots/  # README images (not deployed)
-├── worker/           # Cloudflare Worker: /api/* routes
+├── worker/           # Cloudflare Worker: /api/* routes, stats Durable Object
+├── tests/e2e/        # Playwright browser tests
+├── scripts/          # Generates the PWA icons and og-image.png
 ├── public/           # Static assets
 ├── src/
 │   ├── components/   # UI components
-│   └── lib/          # Compression logic, loaded on demand per file type
+│   ├── hooks/        # Settings and theme state
+│   ├── lib/          # Compression logic, loaded on demand per file type
+│   └── sw.ts         # Service worker (offline, caching, share target)
 ├── index.html        # App entry point
 ├── vite.config.ts    # Vite configuration
 ├── wrangler.toml     # Cloudflare Worker config
@@ -129,9 +147,10 @@ compressly/
 
 Compressly is built with privacy as a core principle:
 
-- **No file storage** — Your files are never persisted on any server.
-- **No tracking** — No analytics or telemetry are attached to your files.
-- **Edge processing** — API functions run on Cloudflare's edge network, meaning processing happens ephemerally and close to you.
+- **Files never leave your device** — All compression runs in the browser (WebAssembly and web workers). No file is uploaded, stored or logged.
+- **Metadata removed by default** — Re-encoded photos drop EXIF data such as GPS location, unless "Keep photo metadata" is on.
+- **Minimal network use** — The only requests with user activity are an anonymous count of files and bytes saved for the public stats. Fonts and libraries are self-hosted; the FFmpeg core (~31 MB, too large for Cloudflare's 25 MiB file limit) is fetched from unpkg only when you add a video or audio file, then cached.
+- **Optional analytics** — If `CF_ANALYTICS_TOKEN` is set at build time, Cloudflare Web Analytics counts page views. It uses no cookies and never sees your files.
 
 You can verify this by inspecting the source code in `worker/` and `src/`.
 
