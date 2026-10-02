@@ -17,6 +17,7 @@ import {
   getPdfImageOptions,
   getPdfRenderOptions,
   getTargetRatio,
+  PDF_TARGET_STEPS,
 } from "./settings";
 
 export type PdfSettings = Pick<CompressionSettings, "level" | "targetBytes" | "pdfMode">;
@@ -64,9 +65,80 @@ export async function compressPdfBytes(
     : recompressPdfImages(data, settings, onProgress, signal);
 }
 
+type PdfJsDocument = Awaited<ReturnType<typeof pdfjsLib.getDocument>["promise"]>;
+type RenderStep = { scale: number; quality: number };
+
+async function renderPage(page: pdfjsLib.PDFPageProxy, scale: number): Promise<OffscreenCanvas> {
+  const viewport = page.getViewport({ scale });
+  const canvas = new OffscreenCanvas(
+    Math.max(1, Math.floor(viewport.width)),
+    Math.max(1, Math.floor(viewport.height)),
+  );
+  await page.render({ canvas: null, canvasContext: canvas.getContext("2d")!, viewport } as any)
+    .promise;
+  return canvas;
+}
+
+/** Builds a PDF whose pages are JPEGs rendered at `step`. */
+async function buildRasterPdf(
+  pdf: PdfJsDocument,
+  step: RenderStep,
+  onProgress: (fraction: number) => void,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  const newPdf = await PDFDocument.create();
+  for (let i = 1; i <= pdf.numPages; i++) {
+    throwIfAborted(signal);
+    const page = await pdf.getPage(i);
+    // Keep the page's physical size; only the embedded image resolution changes.
+    const pageSize = page.getViewport({ scale: 1 });
+    const canvas = await renderPage(page, step.scale);
+    const jpeg = await canvas.convertToBlob({ type: "image/jpeg", quality: step.quality });
+    canvas.width = 0;
+    canvas.height = 0;
+    page.cleanup();
+
+    const image = await newPdf.embedJpg(await jpeg.arrayBuffer());
+    const pdfPage = newPdf.addPage([pageSize.width, pageSize.height]);
+    pdfPage.drawImage(image, { x: 0, y: 0, width: pageSize.width, height: pageSize.height });
+    onProgress(i / pdf.numPages);
+  }
+  return newPdf.save();
+}
+
+/**
+ * Picks the best render step expected to fit `targetBytes`, by encoding the
+ * first page at each step and extrapolating to the whole document.
+ */
+async function pickStepForTarget(pdf: PdfJsDocument, targetBytes: number): Promise<number> {
+  const page = await pdf.getPage(1);
+  const canvases = new Map<number, OffscreenCanvas>();
+  try {
+    for (const [index, step] of PDF_TARGET_STEPS.entries()) {
+      let canvas = canvases.get(step.scale);
+      if (!canvas) {
+        canvas = await renderPage(page, step.scale);
+        canvases.set(step.scale, canvas);
+      }
+      const jpeg = await canvas.convertToBlob({ type: "image/jpeg", quality: step.quality });
+      // ~1.5 KB of PDF structure plus a little per page.
+      const estimate = jpeg.size * pdf.numPages * 1.03 + 1500 + 300 * pdf.numPages;
+      if (estimate <= targetBytes * 0.95) return index;
+    }
+    return PDF_TARGET_STEPS.length - 1;
+  } finally {
+    for (const canvas of canvases.values()) {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+    page.cleanup();
+  }
+}
+
 /**
  * Rasterizes each page to a JPEG and rebuilds the PDF from those images.
- * Smallest output, but text is no longer selectable.
+ * Smallest output, but text is no longer selectable. With a Custom target it
+ * uses the highest quality that fits instead of a fixed formula.
  */
 async function rasterizePdf(
   data: ArrayBuffer,
@@ -74,10 +146,6 @@ async function rasterizePdf(
   onProgress: (percent: number) => void,
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
-  const { scale, quality } = getPdfRenderOptions(
-    settings.level,
-    getTargetRatio(settings, data.byteLength),
-  );
   const inWorker = typeof document === "undefined";
   const pdf = await pdfjsLib.getDocument({
     data,
@@ -88,36 +156,29 @@ async function rasterizePdf(
     useWorkerFetch: true,
   } as any).promise;
   try {
-    const newPdf = await PDFDocument.create();
-    for (let i = 1; i <= pdf.numPages; i++) {
-      throwIfAborted(signal);
-      const page = await pdf.getPage(i);
-      // Keep the page's physical size; only the embedded image resolution changes.
-      const pageSize = page.getViewport({ scale: 1 });
-      const viewport = page.getViewport({ scale });
-      const canvas = new OffscreenCanvas(
-        Math.max(1, Math.floor(viewport.width)),
-        Math.max(1, Math.floor(viewport.height)),
-      );
-      const context = canvas.getContext("2d")!;
-      await page.render({ canvas: null, canvasContext: context, viewport } as any)
-        .promise;
-      const jpeg = await canvas.convertToBlob({ type: "image/jpeg", quality });
-      canvas.width = 0;
-      canvas.height = 0;
-      page.cleanup();
-
-      const image = await newPdf.embedJpg(await jpeg.arrayBuffer());
-      const pdfPage = newPdf.addPage([pageSize.width, pageSize.height]);
-      pdfPage.drawImage(image, {
-        x: 0,
-        y: 0,
-        width: pageSize.width,
-        height: pageSize.height,
-      });
-      onProgress(Math.round((i / pdf.numPages) * 100));
+    const targetBytes = settings.level === "Custom" ? settings.targetBytes : null;
+    if (!targetBytes) {
+      const step = getPdfRenderOptions(settings.level, getTargetRatio(settings, data.byteLength));
+      return await buildRasterPdf(pdf, step, (f) => onProgress(Math.round(f * 100)), signal);
     }
-    return await newPdf.save();
+
+    onProgress(5);
+    let index = await pickStepForTarget(pdf, targetBytes);
+    // If the estimate was optimistic, step down (at most three more passes).
+    for (let attempt = 0; ; attempt++) {
+      throwIfAborted(signal);
+      const base = 10 + attempt * 10;
+      const bytes = await buildRasterPdf(
+        pdf,
+        PDF_TARGET_STEPS[index],
+        (f) => onProgress(Math.min(99, Math.round(base + f * (90 - base)))),
+        signal,
+      );
+      if (bytes.length <= targetBytes || index === PDF_TARGET_STEPS.length - 1 || attempt === 3) {
+        return bytes;
+      }
+      index++;
+    }
   } finally {
     await pdf.destroy();
   }

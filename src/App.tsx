@@ -10,6 +10,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { useSettings } from "./hooks/useSettings";
 import { isAbortError } from "./lib/abort";
+import { describeError } from "./lib/errors";
 import {
   ACCEPTED_TYPES,
   canPreviewOriginal,
@@ -201,11 +202,13 @@ export default function App() {
     if (newFiles.length === 0) return;
     const newItems: FileItem[] = newFiles.map((f) => {
       const kind = getFileKind(f);
+      const empty = f.size === 0;
       return {
         id: createId(),
         file: f,
         kind,
-        status: kind ? "idle" : "unsupported",
+        status: kind && !empty ? "idle" : "unsupported",
+        ...(empty && { error: "This file is empty." }),
         progress: 0,
         originalSize: f.size,
         previewUrl:
@@ -407,6 +410,10 @@ export default function App() {
               compressedSize: undefined,
               compressedBlob: undefined,
               keptOriginal: false,
+              underTarget: false,
+              missedTarget: undefined,
+              missedTargetHint: undefined,
+              error: undefined,
               metadata: undefined,
             }
           : f,
@@ -427,7 +434,8 @@ export default function App() {
         setFiles((prev) =>
           prev.map((f) => (f.id === fileItem.id ? { ...f, waiting: false } : f)),
         );
-        const { blob, keptOriginal, metadata } = await compressFile(
+        const { blob, keptOriginal, underTarget, missedTarget, missedTargetHint, metadata } =
+          await compressFile(
           fileItem.file,
           fileItem.id,
           applyOverrides(settings, fileItem.overrides),
@@ -447,6 +455,9 @@ export default function App() {
                   compressedSize: blob.size,
                   compressedBlob: blob,
                   keptOriginal,
+                  underTarget,
+                  missedTarget,
+                  missedTargetHint,
                   metadata,
                 }
               : f,
@@ -468,7 +479,13 @@ export default function App() {
         setFiles((prev) =>
           prev.map((f) =>
             f.id === fileItem.id
-              ? { ...f, status: cancelled ? "idle" : "error", waiting: false, progress: 0 }
+              ? {
+                  ...f,
+                  status: cancelled ? "idle" : "error",
+                  waiting: false,
+                  progress: 0,
+                  error: cancelled ? undefined : describeError(error, fileItem.kind, fileItem.file),
+                }
               : f,
           ),
         );
@@ -536,13 +553,18 @@ export default function App() {
     [files],
   );
 
+  // Estimate for what the main button will compress: only the newly added
+  // files when some have already run, otherwise everything not in progress.
+  const estimateForNew = newFiles.length > 0 && hasStarted;
   const estimate = useMemo(
     () =>
       estimateSavings(
-        files.filter((f) => isInScope(f, "all")).map((f) => f.originalSize),
+        files
+          .filter((f) => isInScope(f, estimateForNew ? "new" : "all"))
+          .map((f) => f.originalSize),
         settings,
       ),
-    [files, settings],
+    [files, settings, estimateForNew],
   );
 
   const compareItem = compare && files.find((f) => f.id === compare.id);
@@ -712,6 +734,7 @@ export default function App() {
                   update={update}
                   targetValid={settingsValid}
                   estimate={estimate}
+                  estimateLabel={estimateForNew ? "Estimated savings for new files" : "Estimated savings"}
                   kinds={kinds}
                   actions={actionButtons}
                 />

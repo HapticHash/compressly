@@ -88,25 +88,49 @@ export async function compressImage(
     blob = new Blob([buffer], { type: "image/avif" });
   } else {
     const targetMB = (input.size * ratio) / (1024 * 1024);
-    blob = await imageCompression(input, {
-      // Undershoot custom targets by 25% so the result stays under them.
-      maxSizeMB: Math.max(isCustom ? targetMB * 0.75 : targetMB, 0.01),
-      maxWidthOrHeight: maxDimension ?? undefined,
-      // Low/Medium keep the original dimensions; stronger levels may downscale,
-      // which is the only way lossless formats like PNG get meaningfully smaller.
-      alwaysKeepResolution:
-        maxDimension === null &&
-        (settings.level === "Low" || settings.level === "Medium"),
+    const baseOptions = {
       fileType: outputType,
       // Metadata is handled below for every format, not just JPEG to JPEG.
       preserveExif: false,
       useWebWorker: true,
       libURL: new URL(imageCompressionLibUrl, location.href).href,
       maxIteration: 30,
-      initialQuality: isCustom ? 0.6 : 0.8,
       signal,
+    };
+    blob = await imageCompression(input, {
+      ...baseOptions,
+      // Undershoot custom targets by 25% so the result stays under them.
+      maxSizeMB: Math.max(isCustom ? targetMB * 0.75 : targetMB, 0.001),
+      maxWidthOrHeight: maxDimension ?? undefined,
+      // Low/Medium keep the original dimensions; stronger levels may downscale,
+      // which is the only way lossless formats like PNG get meaningfully smaller.
+      alwaysKeepResolution:
+        maxDimension === null &&
+        (settings.level === "Low" || settings.level === "Medium"),
+      // A generous target (e.g. only converting the format) shouldn't start
+      // from low quality.
+      initialQuality: isCustom ? (ratio >= 0.9 ? 0.92 : 0.6) : 0.8,
       onProgress,
     });
+
+    // Small targets (e.g. 20 KB) can be out of reach at full size even at the
+    // lowest quality, so keep shrinking the image until it fits.
+    const targetBytes = isCustom ? settings.targetBytes : null;
+    if (targetBytes && blob.size > targetBytes) {
+      const bitmap = await createImageBitmap(input);
+      let longest = Math.max(bitmap.width, bitmap.height);
+      bitmap.close();
+      for (let attempt = 0; attempt < 8 && blob.size > targetBytes && longest > 64; attempt++) {
+        throwIfAborted(signal);
+        longest = Math.round(longest * 0.7);
+        blob = await imageCompression(input, {
+          ...baseOptions,
+          maxSizeMB: (targetBytes * 0.9) / (1024 * 1024),
+          maxWidthOrHeight: longest,
+          initialQuality: 0.6,
+        });
+      }
+    }
   }
 
   if (!exif) return { blob, converted };

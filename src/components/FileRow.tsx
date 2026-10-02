@@ -31,6 +31,13 @@ export interface FileItem {
   originalSize: number;
   compressedSize?: number;
   keptOriginal?: boolean;
+  /** The original already met the Custom target, so it was left as is. */
+  underTarget?: boolean;
+  /** The Custom target in bytes, when the result is still larger. */
+  missedTarget?: number;
+  missedTargetHint?: string;
+  /** Why the file failed or can't be compressed, for the user. */
+  error?: string;
   metadata?: MetadataOutcome;
   previewUrl?: string;
   compressedBlob?: Blob;
@@ -128,7 +135,17 @@ export const FileRow = memo(function FileRow({
           <div className="flex flex-col text-xs sm:text-sm text-text-muted gap-0.5">
             <span>Original: {formatSize(file.originalSize)}</span>
             {file.status === "done" && file.keptOriginal && (
-              <span className="text-text">Already optimized, original kept</span>
+              <span className="text-text">
+                {file.underTarget
+                  ? "Already under your target, original kept"
+                  : "Already optimized, original kept"}
+              </span>
+            )}
+            {file.status === "done" && file.missedTarget !== undefined && (
+              <span className="text-xs text-accent">
+                Couldn't get under {formatSize(file.missedTarget)}; this is as small as it gets.
+                {file.missedTargetHint && ` ${file.missedTargetHint}`}
+              </span>
             )}
             {file.status === "done" && !file.keptOriginal && file.compressedSize !== undefined && (
               <div className="flex items-center gap-2 flex-wrap">
@@ -160,9 +177,11 @@ export const FileRow = memo(function FileRow({
               </span>
             )}
             {file.status === "unsupported" && (
-              <span className="text-accent">File type not supported</span>
+              <span className="text-accent">{file.error ?? "File type not supported"}</span>
             )}
-            {file.status === "error" && <span className="text-danger">Compression failed</span>}
+            {file.status === "error" && (
+              <span className="text-danger">{file.error ?? "Compression failed"}</span>
+            )}
             {overrides.level && (
               <span className="text-xs">Level for this file: {overrides.level}</span>
             )}
@@ -293,6 +312,13 @@ export const FileRow = memo(function FileRow({
               </label>
             </>
           )}
+          {isMedia &&
+            overrides.trimEnd !== undefined &&
+            overrides.trimEnd <= (overrides.trimStart ?? 0) && (
+              <p role="alert" className="text-xs text-danger basis-full">
+                The end must be after the start.
+              </p>
+            )}
           <p className="text-xs text-text-muted basis-full">
             Changes apply the next time this file is compressed.
           </p>

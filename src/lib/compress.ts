@@ -1,5 +1,10 @@
 import type { MetadataOutcome } from "./image";
-import type { CompressionSettings, FileOverrides } from "./settings";
+import { CompressionError } from "./errors";
+import {
+  type CompressionSettings,
+  type FileOverrides,
+  isUnderTarget,
+} from "./settings";
 
 export type FileKind = "image" | "gif" | "svg" | "media" | "pdf";
 
@@ -42,8 +47,60 @@ export interface CompressResult {
   blob: Blob;
   /** True when compression didn't make the file smaller, so the original is returned. */
   keptOriginal: boolean;
+  /** True when the original already met the Custom target, so nothing was done. */
+  underTarget?: boolean;
+  /** The Custom target in bytes, when the result is still larger than it. */
+  missedTarget?: number;
+  /** What to try instead when the target was missed. */
+  missedTargetHint?: string;
   /** What happened to the photo's EXIF data (images only). */
   metadata?: MetadataOutcome;
+}
+
+/**
+ * Whether the user asked for something beyond "make it smaller" (a new
+ * format, size, length or no audio), which has to happen even when the file
+ * already fits the target.
+ */
+function wantsConversion(
+  kind: FileKind,
+  file: File,
+  settings: CompressionSettings,
+  overrides?: FileOverrides,
+): boolean {
+  if (kind === "image") {
+    return (
+      /^image\/hei[cf]/.test(file.type) ||
+      /\.(heic|heif)$/i.test(file.name) ||
+      settings.image.format !== "original" ||
+      settings.image.maxDimension !== null
+    );
+  }
+  if (kind === "media") {
+    const trimmed = !!(overrides?.trimStart || overrides?.trimEnd);
+    const video = settings.video;
+    return (
+      trimmed ||
+      (file.type.startsWith("video/") &&
+        (video.format !== "mp4" || video.resolution !== null || video.removeAudio))
+    );
+  }
+  return false;
+}
+
+/** Returns the original, stripped of EXIF/XMP when metadata shouldn't be kept. */
+async function originalResult(
+  file: File,
+  kind: FileKind,
+  settings: CompressionSettings,
+  extra: Partial<CompressResult> = {},
+): Promise<CompressResult> {
+  if (kind === "image" && !settings.image.keepMetadata) {
+    const { stripMetadata } = await import("./metadata");
+    const stripped = await stripMetadata(file);
+    if (stripped) return { blob: stripped, keptOriginal: true, metadata: "removed", ...extra };
+  }
+  return { blob: file, keptOriginal: true, ...extra };
 }
 
 /** Each compressor is loaded on demand so its library stays out of the main bundle. */
@@ -56,6 +113,14 @@ export async function compressFile(
   signal?: AbortSignal,
 ): Promise<CompressResult> {
   const kind = getFileKind(file);
+  if (!kind) throw new CompressionError("This file type isn't supported.");
+  if (file.size === 0) throw new CompressionError("This file is empty.");
+
+  // Already within the Custom target: don't lose quality for nothing.
+  if (isUnderTarget(settings, file.size) && !wantsConversion(kind, file, settings, overrides)) {
+    return originalResult(file, kind, settings, { underTarget: true });
+  }
+
   let blob: Blob;
   // A conversion the user asked for (new format, size or length) is always
   // returned, even when it isn't smaller than the original.
@@ -98,20 +163,30 @@ export async function compressFile(
         signal,
       );
       break;
-    default:
-      throw new Error(`Unsupported file type: ${file.type || "unknown"}`);
   }
+
+  const missedTarget =
+    settings.level === "Custom" && settings.targetBytes !== null
+      ? settings.targetBytes
+      : null;
+  const missedTargetHint =
+    kind === "pdf" && settings.pdfMode === "keep-text"
+      ? "Try “Smallest size” PDF mode."
+      : kind === "image" && settings.image.maxDimension === null
+        ? "Try a smaller max size."
+        : undefined;
   if (!converted && blob.size >= file.size) {
-    // Compression didn't help, so return the original. For photos, still
-    // honour the metadata setting by stripping EXIF/XMP losslessly.
-    if (kind === "image" && !settings.image.keepMetadata) {
-      const { stripMetadata } = await import("./metadata");
-      const stripped = await stripMetadata(file);
-      if (stripped) return { blob: stripped, keptOriginal: true, metadata: "removed" };
-    }
-    return { blob: file, keptOriginal: true };
+    // Compression didn't help, so return the original.
+    return originalResult(file, kind, settings, {
+      ...(missedTarget !== null && file.size > missedTarget && { missedTarget, missedTargetHint }),
+    });
   }
-  return { blob, keptOriginal: false, metadata };
+  return {
+    blob,
+    keptOriginal: false,
+    metadata,
+    ...(missedTarget !== null && blob.size > missedTarget && { missedTarget, missedTargetHint }),
+  };
 }
 
 export async function createZip(

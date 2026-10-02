@@ -68,6 +68,7 @@ interface SettingsPanelProps {
   update: (patch: Partial<StoredSettings>) => void;
   targetValid: boolean;
   estimate: { saved: number; percentage: number } | null;
+  estimateLabel: string;
   kinds: { image: boolean; pdf: boolean; video: boolean };
   actions: ReactNode;
 }
@@ -77,6 +78,7 @@ export function SettingsPanel({
   update,
   targetValid,
   estimate,
+  estimateLabel,
   kinds,
   actions,
 }: SettingsPanelProps) {
@@ -156,7 +158,7 @@ export function SettingsPanel({
               </div>
               {!targetValid && (
                 <p id="target-size-hint" className="mt-2 text-xs text-accent">
-                  Enter a target size greater than 0.
+                  Enter a target between 1 KB and 100 GB.
                 </p>
               )}
             </motion.div>
@@ -318,12 +320,16 @@ export function SettingsPanel({
           <div className="w-full text-sm text-text-muted flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2 bg-primary/5 p-3.5 rounded-xl border border-primary/10">
             <div className="flex items-center gap-2">
               <Activity className="w-4 h-4 text-primary shrink-0" />
-              <span>Estimated savings:</span>
+              <span>{estimateLabel}:</span>
             </div>
-            <div className="flex items-center gap-1">
-              <span className="font-semibold text-primary-dark">{formatSize(estimate.saved)}</span>
-              <span>({estimate.percentage}%)</span>
-            </div>
+            {estimate.saved > 0 ? (
+              <div className="flex items-center gap-1">
+                <span className="font-semibold text-primary-dark">≈ {formatSize(estimate.saved)}</span>
+                <span>({estimate.percentage}%)</span>
+              </div>
+            ) : (
+              <span>none, the files are already within your target</span>
+            )}
           </div>
         )}
 

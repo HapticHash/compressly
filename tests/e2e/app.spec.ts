@@ -199,3 +199,57 @@ test('files added mid-run get their own section and button', async ({ page, file
   await expect(rowFor(page, 'icon.svg')).toContainText('New:');
   await expect(page.getByRole('heading', { name: /Newly added/ })).toHaveCount(0);
 });
+
+test('explains why broken files fail', async ({ page }) => {
+  await page.goto('/');
+  await page.setInputFiles('input[type="file"]', [
+    { name: 'empty.jpg', mimeType: 'image/jpeg', buffer: Buffer.alloc(0) },
+    { name: 'fake.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('not an image') },
+    { name: 'broken.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.7\ngarbage') },
+  ]);
+  await expect(rowFor(page, 'empty.jpg')).toContainText('This file is empty.');
+  await page.getByRole('button', { name: 'Compress All', exact: true }).click();
+  await waitForQueue(page);
+  await expect(rowFor(page, 'fake.jpg')).toContainText("Couldn't read this image");
+  await expect(rowFor(page, 'broken.pdf')).toContainText("Couldn't read this PDF");
+});
+
+test('custom targets: keeps files already under, rejects tiny ones, fits PDFs', async ({ page, files }) => {
+  await page.setInputFiles('input[type="file"]', [toFile(files.jpg), toFile(files.pdf)]);
+  await page.getByRole('button', { name: 'Custom', exact: true }).click();
+
+  await page.fill('#target-size', '0.0001');
+  await page.selectOption('select[aria-label="Target size unit"]', 'KB');
+  await expect(page.getByRole('button', { name: 'Compress All', exact: true })).toBeDisabled();
+
+  // Above both files' sizes: nothing should be re-encoded.
+  await page.fill('#target-size', '50');
+  await page.selectOption('select[aria-label="Target size unit"]', 'MB');
+  await page.getByRole('button', { name: 'Compress All', exact: true }).click();
+  await waitForQueue(page);
+  await expect(rowFor(page, 'photo.jpg')).toContainText('Already under your target');
+
+  // A PDF target should be met without collapsing far below it.
+  await page.getByRole('button', { name: 'Smallest size' }).click();
+  await page.fill('#target-size', '150');
+  await page.selectOption('select[aria-label="Target size unit"]', 'KB');
+  await page.getByRole('button', { name: 'Re-compress All', exact: true }).click();
+  await waitForQueue(page);
+  const pdf = await download(page, 'doc.pdf');
+  expect(pdf.bytes.length).toBeLessThanOrEqual(150 * 1024);
+  expect(pdf.bytes.length).toBeGreaterThan(30 * 1024);
+});
+
+test('rejects trims outside the clip', async ({ page, files }) => {
+  await page.setInputFiles('input[type="file"]', [toFile(files.webm)]);
+  const row = rowFor(page, 'clip.webm');
+  await row.getByRole('button', { name: /^Options/ }).click();
+  await row.getByLabel('Start (seconds)').fill('2');
+  await row.getByLabel('End (seconds)').fill('1');
+  await expect(row.getByRole('alert')).toContainText('The end must be after the start.');
+  await row.getByLabel('Start (seconds)').fill('60');
+  await row.getByLabel('End (seconds)').fill('');
+  await page.getByRole('button', { name: 'Compress', exact: true }).click();
+  await waitForQueue(page);
+  await expect(row).toContainText('is past the end of the clip');
+});

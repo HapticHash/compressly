@@ -1,5 +1,6 @@
 import type { FFmpeg } from "@ffmpeg/ffmpeg";
 import { abortError, throwIfAborted } from "./abort";
+import { CompressionError } from "./errors";
 import {
   type CompressionSettings,
   type FileOverrides,
@@ -33,10 +34,18 @@ export function loadFFmpeg(): Promise<FFmpeg> {
         import("@ffmpeg/util"),
       ]);
       const ffmpeg = new FFmpeg();
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.wasm`, "application/wasm"),
-      });
+      try {
+        await ffmpeg.load({
+          coreURL: await toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.js`, "text/javascript"),
+          wasmURL: await toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.wasm`, "application/wasm"),
+        });
+      } catch {
+        throw new CompressionError(
+          navigator.onLine === false
+            ? "Video and audio need an internet connection the first time, to download the 31 MB video engine. It works offline after that."
+            : "Couldn't download the video engine. Check your connection and try again.",
+        );
+      }
       return ffmpeg;
     })();
     // Allow a retry after a failed load (e.g. a network blip).
@@ -60,25 +69,37 @@ function getExtension(name: string): string {
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : "bin";
 }
 
-/** Reads the duration from the file's metadata; null if the browser can't. */
-function getMediaDuration(file: File): Promise<number | null> {
+interface MediaInfo {
+  /** Seconds, or null when the browser can't tell. */
+  duration: number | null;
+  /** False for audio-only files, null when the browser can't tell. */
+  hasVideo: boolean | null;
+}
+
+/** Reads duration and whether there's a video track from the file's metadata. */
+function probeMedia(file: File): Promise<MediaInfo> {
   return new Promise((resolve) => {
     const url = URL.createObjectURL(file);
-    const el = document.createElement(
-      file.type.startsWith("video/") ? "video" : "audio",
-    );
-    const done = (value: number | null) => {
+    const isVideoType = file.type.startsWith("video/");
+    const el = document.createElement(isVideoType ? "video" : "audio");
+    const done = (info: MediaInfo) => {
       URL.revokeObjectURL(url);
       el.removeAttribute("src");
-      resolve(value);
+      resolve(info);
     };
     el.preload = "metadata";
     el.onloadedmetadata = () =>
-      done(Number.isFinite(el.duration) && el.duration > 0 ? el.duration : null);
-    el.onerror = () => done(null);
+      done({
+        // Recordings from MediaRecorder report Infinity until fully read.
+        duration: Number.isFinite(el.duration) && el.duration > 0 ? el.duration : null,
+        hasVideo: isVideoType ? (el as HTMLVideoElement).videoWidth > 0 : false,
+      });
+    el.onerror = () => done({ duration: null, hasVideo: null });
     el.src = url;
   });
 }
+
+const seconds = (value: number) => `${Math.round(value * 10) / 10} s`;
 
 const OUTPUT = {
   mp4: { ext: "mp4", type: "video/mp4" },
@@ -101,20 +122,27 @@ export async function compressMedia(
   onProgress: (percent: number) => void,
   signal?: AbortSignal,
 ): Promise<MediaResult> {
-  const isVideo = file.type.startsWith("video/");
+  const trimStart = overrides?.trimStart && overrides.trimStart > 0 ? overrides.trimStart : null;
+  const trimEnd = overrides?.trimEnd && overrides.trimEnd > 0 ? overrides.trimEnd : null;
+  if (trimEnd !== null && trimEnd <= (trimStart ?? 0)) {
+    throw new CompressionError("The trim end must be after the start.");
+  }
+
+  const info = await probeMedia(file);
+  if (info.duration !== null && trimStart !== null && trimStart >= info.duration) {
+    throw new CompressionError(
+      `The trim start (${seconds(trimStart)}) is past the end of the clip (${seconds(info.duration)}).`,
+    );
+  }
+  // Voice recordings often come as video/webm with no picture: treat as audio.
+  const isVideo = file.type.startsWith("video/") && info.hasVideo !== false;
   const { format, resolution, removeAudio } = settings.video;
   const output = isVideo ? OUTPUT[format] : OUTPUT.audio;
   const ratio = getTargetRatio(settings, file.size);
-  const trimStart = overrides?.trimStart && overrides.trimStart > 0 ? overrides.trimStart : null;
-  const trimEnd =
-    overrides?.trimEnd && overrides.trimEnd > (trimStart ?? 0) ? overrides.trimEnd : null;
 
-  const needsDuration = isVideo && settings.level === "Custom" && settings.targetBytes;
-  const fullDuration = needsDuration ? await getMediaDuration(file) : null;
+  const end = Math.min(trimEnd ?? Infinity, info.duration ?? Infinity);
   const duration =
-    fullDuration === null
-      ? null
-      : (trimEnd ?? fullDuration) - (trimStart ?? 0);
+    info.duration === null && trimEnd === null ? null : end - (trimStart ?? 0);
   const { fetchFile } = await import("@ffmpeg/util");
   throwIfAborted(signal);
 
@@ -144,7 +172,7 @@ export async function compressMedia(
     } else {
       const audioKbps = 96;
       const targetKbps =
-        duration && settings.targetBytes
+        duration && settings.level === "Custom" && settings.targetBytes
           ? getVideoBitrateForTarget(
               settings.targetBytes,
               duration,
@@ -202,9 +230,16 @@ export async function compressMedia(
       const exitCode = await ffmpeg.exec(args);
       throwIfAborted(signal);
       if (exitCode !== 0) {
-        throw new Error(`FFmpeg exited with code ${exitCode}`);
+        throw new CompressionError(
+          "Couldn't process this file. It may be damaged or use a format the video engine doesn't support.",
+        );
       }
       const data = (await ffmpeg.readFile(outputName)) as Uint8Array;
+      // A trim outside the clip (when the length couldn't be read up front)
+      // yields a container with no frames.
+      if (data.length < 1024 && file.size > 8 * 1024) {
+        throw new CompressionError("Nothing was left after compressing. Check the trim range.");
+      }
       return {
         blob: new Blob([data], { type: output.type }),
         converted:

@@ -87,11 +87,21 @@ const PRESET_RATIOS: Record<Exclude<CompressionLevel, "Custom">, number> = {
   Extreme: 0.15,
 };
 
-/** Parses the target size input. Returns bytes, or null if not a positive number. */
+/** Smallest target accepted; below this no real file format fits. */
+export const MIN_TARGET_BYTES = 1024;
+export const MAX_TARGET_BYTES = 100 * 1024 ** 3;
+
+/** Parses the target size input. Returns bytes, or null if outside 1 KB to 100 GB. */
 export function parseTarget(value: string, unit: TargetUnit = "MB"): number | null {
   const amount = parseFloat(value);
-  if (!Number.isFinite(amount) || amount <= 0) return null;
-  return amount * 1024 * (unit === "MB" ? 1024 : 1);
+  if (!Number.isFinite(amount)) return null;
+  const bytes = amount * 1024 * (unit === "MB" ? 1024 : 1);
+  return bytes >= MIN_TARGET_BYTES && bytes <= MAX_TARGET_BYTES ? bytes : null;
+}
+
+/** True when a Custom target is already met by the original file. */
+export function isUnderTarget(settings: TargetSettings, size: number): boolean {
+  return settings.level === "Custom" && settings.targetBytes !== null && size <= settings.targetBytes;
 }
 
 export function isSettingsValid(settings: TargetSettings): boolean {
@@ -105,7 +115,8 @@ export function getTargetRatio(
 ): number {
   if (settings.level !== "Custom") return PRESET_RATIOS[settings.level];
   if (!settings.targetBytes || originalSize <= 0) return PRESET_RATIOS.Medium;
-  return Math.min(settings.targetBytes / originalSize, 0.9);
+  // A target at or above the file size asks for no reduction at all.
+  return Math.min(settings.targetBytes / originalSize, 1);
 }
 
 export function getVideoCrf(level: CompressionLevel, ratio: number): number {
@@ -240,6 +251,23 @@ export function getAvifQuality(level: PresetLevel): number {
 }
 
 export const AVIF_CUSTOM_QUALITIES = [65, 50, 38, 28, 20, 12];
+
+/**
+ * Render scale and JPEG quality steps for "Smallest size" PDFs with a Custom
+ * target, best first. The compressor picks the first step that fits.
+ */
+export const PDF_TARGET_STEPS: { scale: number; quality: number }[] = [
+  { scale: 2, quality: 0.8 },
+  { scale: 1.5, quality: 0.75 },
+  { scale: 1.5, quality: 0.6 },
+  { scale: 1.25, quality: 0.55 },
+  { scale: 1, quality: 0.5 },
+  { scale: 1, quality: 0.4 },
+  { scale: 0.8, quality: 0.35 },
+  { scale: 0.65, quality: 0.3 },
+  { scale: 0.5, quality: 0.25 },
+  { scale: 0.35, quality: 0.2 },
+];
 
 /** JPEG quality and longest side used when re-compressing images inside a PDF. */
 export function getPdfImageOptions(
